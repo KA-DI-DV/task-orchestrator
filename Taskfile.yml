@@ -1,0 +1,49 @@
+# Скорочення для частих команд (https://taskfile.dev).
+# Встановити: brew install go-task
+#
+#   task                              — список команд
+#   task up                           — зібрати і запустити все в Docker
+#   task run KEY=PROJ-123
+#
+# Змінна називається KEY, а не TASK: TASK у Taskfile зарезервована
+# (це назва поточної команди).
+version: '3'
+
+tasks:
+  default:
+    desc: Показати список команд
+    silent: true
+    cmds:
+      - task --list
+
+  up:
+    desc: Зібрати і запустити все в Docker
+    cmds:
+      - docker compose up -d --build
+
+  down:
+    desc: Зупинити
+    cmds:
+      - docker compose down
+
+  logs:
+    desc: Логи оркестратора
+    cmds:
+      - docker compose logs -f orchestrator
+
+  run:
+    desc: "Виконати задачу: task run KEY=PROJ-123 [REPO=основний-репо, за замовчуванням main_repo]"
+    requires:
+      vars: [KEY]
+    cmds:
+      - docker compose exec orchestrator orchestrator run {{.KEY}} {{if .REPO}}--repo {{.REPO}}{{end}}
+
+  status:
+    desc: "Стан задач (усіх або однієї: task status KEY=PROJ-123)"
+    cmds:
+      - docker compose exec orchestrator orchestrator status {{.KEY}}
+
+  test:
+    desc: Запустити Go-тести (в Docker, локальний Go не потрібен)
+    cmds:
+      - docker run --rm -v "{{.ROOT_DIR}}":/src -w /src golang:1.27-trixie go test ./...

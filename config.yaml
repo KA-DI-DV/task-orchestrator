@@ -1,0 +1,49 @@
+# Конфігурація оркестратора.
+# Секрети (паролі, токени) краще передавати через змінні оточення (.env) —
+# вони перевизначають значення з цього файлу.
+
+server:
+  port: 8080
+
+database:
+  # Якщо задано DATABASE_URL (так робить docker-compose) — поля нижче ігноруються.
+  host: "localhost"
+  port: 5432
+  user: "orchestrator"
+  password: "orchestrator_secret_password"
+  dbname: "orchestrator_db"
+  sslmode: "disable"
+
+orchestrator:
+  repos_base_dir: "/workspaces"      # тут лежать твої репозиторії (в Docker — змонтована папка з Mac)
+  worktrees_dir: "/tmp/workspaces"   # тут створюються worktree для задач
+  # Claude запускається в main_repo, а worktree (гілка feature/<KEY>) створюється
+  # для ВСІХ репозиторіїв з repos_base_dir, крім exclude_repos, — задача може
+  # потребувати змін у кількох репозиторіях.
+  main_repo: "game-rgs-backend"
+  exclude_repos: ["game-client", "game-configurator"]   # фронт
+  max_review_cycles: 3               # ліміт ітерацій Developer <-> Reviewer (Anti-Loop)
+  agent_timeout: "45m"               # максимальний час одного запуску агента
+  cleanup_worktree: true             # видаляти worktree після завершення (гілка лишається)
+
+roles:
+  developer:
+    cli_flags: ["--dangerously-skip-permissions"]
+    # model: "opus"    # необов'язково: яку модель використовувати для ролі
+    system_instruction: "Ти досвідчений senior розробник. Дотримуйся локальних правил репозиторію. Напиши код та всі тести відповідно до правил репозиторію."
+
+  reviewer:
+    cli_flags: ["--dangerously-skip-permissions"]
+    system_instruction: "Ти прискіпливий, але справедливий рев'юер. Перевіряй лише суттєве: баги, безпеку, відповідність задачі, тести. Звертай увагу на правила та як має писатись код в репозиторії та слідуй їм."
+
+  tester:
+    # --mcp-config підключає Browser MCP (Playwright + Chromium), який встановлено в Docker-образі.
+    cli_flags: ["--dangerously-skip-permissions", "--mcp-config", "/app/mcp/browser.json"]
+    system_instruction: "Ти QA-інженер. Запусти локальні тести та використай Browser MCP для перевірки UI сценаріїв."
+
+  jira:
+    # З Jira працює сам Claude Code через Jira MCP (mcp-atlassian, встановлено в Docker-образі).
+    # Доступ до Jira — змінні JIRA_URL / JIRA_USERNAME / JIRA_API_TOKEN з .env.
+    cli_flags: ["--dangerously-skip-permissions", "--mcp-config", "/app/mcp/jira.json", "--strict-mcp-config"]
+    model: "haiku"   # лише прочитати задачу і написати коментар — велика модель не потрібна
+    system_instruction: "Ти працюєш з Jira виключно через інструменти Jira MCP. Нічого не вигадуй: якщо інструмент повернув помилку — так і скажи."
