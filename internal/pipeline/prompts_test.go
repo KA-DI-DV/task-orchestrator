@@ -42,13 +42,6 @@ func TestIsTestPassed(t *testing.T) {
 	}
 }
 
-func TestTruncateKeepsUTF8(t *testing.T) {
-	got := truncate("Привіт", 3)
-	if got != "При\n…(обрізано)" {
-		t.Errorf("отримав %q", got)
-	}
-}
-
 func TestPromptsListRepos(t *testing.T) {
 	task := &storage.Task{
 		ID:         "PROJ-1",

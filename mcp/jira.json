@@ -3,7 +3,7 @@
     "jira": {
       "command": "mcp-atlassian",
       "env": {
-        "ENABLED_TOOLS": "jira_get_issue,jira_add_comment"
+        "ENABLED_TOOLS": "jira_get_issue"
       }
     }
   }

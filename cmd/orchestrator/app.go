@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"orchestrator/internal/agent"
@@ -45,7 +46,12 @@ func newApp(ctx context.Context, configPath string) (*App, error) {
 		return nil, err
 	}
 
-	runner := &agent.Runner{Binary: "claude", Timeout: cfg.Orchestrator.AgentTimeout}
+	runner := &agent.Runner{
+		Binary:  "claude",
+		Timeout: cfg.Orchestrator.AgentTimeout,
+		// Журнал дій агентів: /tmp/workspaces/.logs/<KEY>.log (дивитися: task watch KEY=...).
+		LogDir: filepath.Join(cfg.Orchestrator.WorktreesDir, ".logs"),
+	}
 	ws := &workspace.Manager{
 		ReposBaseDir: cfg.Orchestrator.ReposBaseDir,
 		WorktreesDir: cfg.Orchestrator.WorktreesDir,
@@ -84,7 +90,7 @@ func (a *App) Close() {
 
 // Serve запускає HTTP-сервер і коректно зупиняє його при Ctrl+C / docker stop.
 func (a *App) Serve(ctx context.Context) error {
-	server := api.NewServer(ctx, a.Pipeline, a.Store)
+	server := api.NewServer(ctx, a.Pipeline, a.Store, a.Pipeline.Runner.LogDir)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", a.Config.Server.Port),
 		Handler:           server.Handler(),

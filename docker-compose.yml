@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: orchestrator_secret_password
       POSTGRES_DB: orchestrator_db
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       # Для PostgreSQL 18+ монтуємо /var/lib/postgresql (а не .../data, як у старих версіях).
       - postgres_data:/var/lib/postgresql
@@ -43,6 +43,16 @@ services:
       # Конфіг і MCP можна міняти без перезбирання образу.
       - ./config.yaml:/app/config.yaml:ro
       - ./mcp:/app/mcp:ro
+    restart: unless-stopped
+
+  # Адмін-панель (React). nginx роздає зібраний застосунок і проксує /api до оркестратора.
+  admin:
+    build: ./admin
+    container_name: orchestrator_admin
+    depends_on:
+      - orchestrator
+    ports:
+      - "3080:80"
     restart: unless-stopped
 
 volumes:

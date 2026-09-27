@@ -29,7 +29,7 @@ func TestLoadProjectConfig(t *testing.T) {
 	if cfg.Orchestrator.MainRepo == "" {
 		t.Error("main_repo не задано")
 	}
-	want := "postgres://orchestrator:orchestrator_secret_password@localhost:5432/orchestrator_db?sslmode=disable"
+	want := "postgres://orchestrator:orchestrator_secret_password@localhost:5433/orchestrator_db?sslmode=disable"
 	if got := cfg.DatabaseURL(); got != want {
 		t.Errorf("DatabaseURL() = %s", got)
 	}

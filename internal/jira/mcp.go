@@ -11,7 +11,8 @@ import (
 
 // MCPClient працює з Jira через Claude Code, у якого підключений Jira MCP
 // (mcp-atlassian, конфіг — mcp/jira.json). Оркестратор просто просить Claude:
-// "дістань задачу і поверни JSON" або "додай коментар".
+// "дістань задачу і поверни JSON". Результати роботи в Jira не пишемо —
+// вони зберігаються в БД і видно їх в адмін-панелі.
 //
 // Налаштування (прапорці, модель) беруться з ролі "jira" у config.yaml.
 type MCPClient struct {
@@ -23,8 +24,9 @@ type MCPClient struct {
 }
 
 // run запускає claude з налаштуваннями ролі jira.
-func (c *MCPClient) run(ctx context.Context, prompt string) (*agent.Result, error) {
+func (c *MCPClient) run(ctx context.Context, key, prompt string) (*agent.Result, error) {
 	return c.Runner.Run(ctx, agent.Request{
+		TaskID:            key,
 		Role:              "jira",
 		WorkDir:           c.WorkDir,
 		Prompt:            prompt,
@@ -40,7 +42,7 @@ func (c *MCPClient) GetIssue(ctx context.Context, key string) (*Issue, error) {
 {"key": "...", "summary": "...", "description": "...", "labels": ["..."]}
 Якщо задачу отримати не вдалося — відповідай {"error": "<причина>"}.`, key)
 
-	res, err := c.run(ctx, prompt)
+	res, err := c.run(ctx, key, prompt)
 	if err != nil {
 		return nil, err
 	}
@@ -64,12 +66,6 @@ func (c *MCPClient) GetIssue(ctx context.Context, key string) (*Issue, error) {
 		issue.Key = key
 	}
 	return &issue, nil
-}
-
-func (c *MCPClient) AddComment(ctx context.Context, key, text string) error {
-	prompt := fmt.Sprintf("Використай Jira MCP і додай до задачі %s такий коментар (дослівно):\n\n%s", key, text)
-	_, err := c.run(ctx, prompt)
-	return err
 }
 
 // extractJSON вирізає текст від першої "{" до останньої "}" —

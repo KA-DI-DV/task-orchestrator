@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"orchestrator/internal/agent"
 	"orchestrator/internal/config"
@@ -256,7 +257,11 @@ func (p *Pipeline) prepare(ctx context.Context, task *storage.Task) error {
 
 // develop: IN_DEV → IN_REVIEW. Developer пише код, ми комітимо результат.
 func (p *Pipeline) develop(ctx context.Context, task *storage.Task) error {
-	if _, err := p.runAgent(ctx, task, "developer", stepDevelopment, developerPrompt(task)); err != nil {
+	iteration := task.ReviewAttempts + 1
+	prompt := developerPrompt(task)
+	res, err := p.runAgent(ctx, task, "developer", prompt)
+	if err != nil {
+		p.addLog(ctx, task, stepDevelopment, "developer", iteration, prompt, res, err, "", "")
 		return err
 	}
 
@@ -267,37 +272,48 @@ func (p *Pipeline) develop(ctx context.Context, task *storage.Task) error {
 	if err := p.commitAll(ctx, task, msg); err != nil {
 		return err
 	}
+	if err := p.refreshRepoStats(ctx, task); err != nil {
+		return err
+	}
 
+	p.addLog(ctx, task, stepDevelopment, "developer", iteration, prompt, res, nil, verdictDone, "")
 	task.Status = storage.StatusInReview
 	return nil
 }
 
 // review: IN_REVIEW → IN_TEST (схвалено або ліміт) або назад у IN_DEV.
 func (p *Pipeline) review(ctx context.Context, task *storage.Task) error {
+	iteration := task.ReviewAttempts + 1
 	changed, err := p.changedRepos(ctx, task)
 	if err != nil {
 		return err
 	}
-	res, err := p.runAgent(ctx, task, "reviewer", stepReview, reviewerPrompt(task, changed))
-	if err != nil {
-		return err
-	}
+	prompt := reviewerPrompt(task, changed)
+	res, err := p.runAgent(ctx, task, "reviewer", prompt)
 
 	// Читаємо review_feedback.md (якщо рев'юер його створив) і одразу
 	// видаляємо, щоб файл не потрапив у коміт.
 	feedbackPath := filepath.Join(task.WorktreePath, reviewFeedbackFile)
-	feedback, _ := os.ReadFile(feedbackPath) // помилку ігноруємо: файлу може й не бути
+	feedbackBytes, _ := os.ReadFile(feedbackPath) // помилку ігноруємо: файлу може й не бути
 	_ = os.Remove(feedbackPath)
+	feedback := strings.TrimSpace(string(feedbackBytes))
+
+	if err != nil {
+		p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, err, "", feedback)
+		return err
+	}
 
 	if isApproved(res.Text) {
 		slog.Info("рев'ю пройдено ✅", "key", task.ID)
+		p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, nil, verdictApprove, feedback)
 		task.LastFeedback = ""
 		task.Status = storage.StatusInTest
 		return nil
 	}
+	p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, nil, verdictChanges, feedback)
 
 	// Зауваження: беремо з файлу, а якщо файлу немає — з відповіді агента.
-	task.LastFeedback = strings.TrimSpace(string(feedback))
+	task.LastFeedback = feedback
 	if task.LastFeedback == "" {
 		task.LastFeedback = res.Text
 	}
@@ -318,12 +334,15 @@ func (p *Pipeline) review(ctx context.Context, task *storage.Task) error {
 
 // test: IN_TEST → COMPLETED або FAILED.
 func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
+	iteration := task.ReviewAttempts + 1
 	changed, err := p.changedRepos(ctx, task)
 	if err != nil {
 		return err
 	}
-	res, err := p.runAgent(ctx, task, "tester", stepTesting, testerPrompt(task, changed))
+	prompt := testerPrompt(task, changed)
+	res, err := p.runAgent(ctx, task, "tester", prompt)
 	if err != nil {
+		p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, err, "", "")
 		return err
 	}
 
@@ -331,27 +350,30 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	if err := p.commitAll(ctx, task, task.ID+": тести від QA-агента"); err != nil {
 		return err
 	}
-
-	if !isTestPassed(res.Text) {
-		// Звіт тестувальника стане фідбеком для Developer'а при resume.
-		task.LastFeedback = "Звіт QA:\n" + res.Text
-		return errors.New("тестування не пройдено, подробиці — у логах етапу TESTING")
-	}
-
-	// Список змінених репозиторіїв беремо ще раз: QA міг дописати тести.
-	if changed, err = p.changedRepos(ctx, task); err != nil {
+	if err := p.refreshRepoStats(ctx, task); err != nil {
 		return err
 	}
-	p.notifyJira(ctx, task, changed, res.Text)
+	task.TestReport = res.Text
+
+	if !isTestPassed(res.Text) {
+		p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, nil, testFailed, "")
+		// Звіт тестувальника стане фідбеком для Developer'а при resume.
+		task.LastFeedback = "Звіт QA:\n" + res.Text
+		return errors.New("тестування не пройдено, подробиці — у звіті QA")
+	}
+
+	p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, nil, testPassed, "")
 	p.cleanup(ctx, task)
+	now := time.Now()
+	task.CompletedAt = &now
 	task.Status = storage.StatusCompleted
 	return nil
 }
 
 // ───────────────────────────── Допоміжне ─────────────────────────────
 
-// runAgent запускає claude з налаштуваннями ролі та пише лог у БД.
-func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, step, prompt string) (*agent.Result, error) {
+// runAgent запускає claude з налаштуваннями ролі.
+func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, prompt string) (*agent.Result, error) {
 	roleCfg := p.Roles[role]
 
 	// claude запускається в основному репозиторії, а worktree інших
@@ -364,7 +386,8 @@ func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, step,
 		}
 	}
 
-	res, err := p.Runner.Run(ctx, agent.Request{
+	return p.Runner.Run(ctx, agent.Request{
+		TaskID:            task.ID,
 		Role:              role,
 		WorkDir:           task.WorktreePath,
 		Prompt:            prompt,
@@ -372,16 +395,44 @@ func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, step,
 		Model:             roleCfg.Model,
 		ExtraFlags:        flags,
 	})
+}
 
-	// Лог зберігаємо завжди — і при успіху, і при помилці.
-	if res != nil {
-		logText := fmt.Sprintf("=== PROMPT ===\n%s\n\n=== RESULT ===\n%s\n\n=== RAW OUTPUT ===\n%s",
-			prompt, res.Text, res.RawLog)
-		if logErr := p.Store.AddLog(ctx, task.ID, step, role, logText); logErr != nil {
-			slog.Error("не вдалося записати лог", "error", logErr)
+// addLog записує запуск агента в історію задачі (таблиця task_logs).
+// Якщо агент завершився помилкою (runErr != nil), вердикт — ERROR,
+// а якщо його зупинили (Ctrl+C / зупинка контейнера) — INTERRUPTED.
+func (p *Pipeline) addLog(ctx context.Context, task *storage.Task, step, role string, iteration int,
+	prompt string, res *agent.Result, runErr error, verdict, feedback string) {
+	if runErr != nil {
+		verdict = verdictError
+		if ctx.Err() != nil {
+			verdict = verdictInterrupted
 		}
 	}
-	return res, err
+
+	l := &storage.TaskLog{
+		TaskID:    task.ID,
+		StepName:  step,
+		AgentRole: role,
+		Iteration: iteration,
+		Verdict:   verdict,
+		Prompt:    prompt,
+		Feedback:  feedback,
+	}
+	if res != nil {
+		l.Summary = res.Text
+		l.CostUSD = res.CostUSD
+		l.NumTurns = res.NumTurns
+		l.DurationMS = res.Duration.Milliseconds()
+		l.OutputLog = res.RawLog
+	}
+	if runErr != nil && l.Summary == "" {
+		l.Summary = runErr.Error()
+	}
+
+	// WithoutCancel: навіть якщо задачу зупинили, запис в історію має дійти до БД.
+	if err := p.Store.AddLog(context.WithoutCancel(ctx), l); err != nil {
+		slog.Error("не вдалося записати лог", "key", task.ID, "error", err)
+	}
 }
 
 // fail переводить задачу у FAILED, записує помилку та прибирає worktree.
@@ -392,7 +443,16 @@ func (p *Pipeline) fail(ctx context.Context, task *storage.Task, cause error) er
 	for _, r := range task.Repos {
 		_, _ = p.Workspace.CommitAll(ctx, r.WorktreePath, task.ID+": WIP (задача завершилась помилкою)")
 	}
-	_ = p.Store.AddLog(ctx, task.ID, stepError, "orchestrator", cause.Error())
+	// Помилку ігноруємо: якщо задача впала ще до створення worktree, статистики немає.
+	_ = p.refreshRepoStats(ctx, task)
+	_ = p.Store.AddLog(ctx, &storage.TaskLog{
+		TaskID:    task.ID,
+		StepName:  stepError,
+		AgentRole: "orchestrator",
+		Iteration: task.ReviewAttempts + 1,
+		Verdict:   verdictError,
+		Summary:   cause.Error(),
+	})
 	p.cleanup(ctx, task)
 
 	task.Status = storage.StatusFailed
@@ -432,52 +492,31 @@ func (p *Pipeline) commitAll(ctx context.Context, task *storage.Task, message st
 	return nil
 }
 
+// refreshRepoStats оновлює в task.Repos кількість комітів, останній коміт
+// і diff --stat. Після етапу SaveTask запише це в БД — так історія змін
+// лишається навіть після видалення worktree.
+func (p *Pipeline) refreshRepoStats(ctx context.Context, task *storage.Task) error {
+	for i := range task.Repos {
+		r := &task.Repos[i]
+		commits, head, diffStat, err := p.Workspace.Stats(ctx, r.WorktreePath, r.BaseCommit)
+		if err != nil {
+			return fmt.Errorf("статистика змін у %s: %w", r.RepoName, err)
+		}
+		r.Commits, r.HeadCommit, r.DiffStat = commits, head, diffStat
+	}
+	return nil
+}
+
 // changedRepos повертає репозиторії, у гілці яких є коміти задачі.
 func (p *Pipeline) changedRepos(ctx context.Context, task *storage.Task) ([]storage.TaskRepo, error) {
+	if err := p.refreshRepoStats(ctx, task); err != nil {
+		return nil, err
+	}
 	var changed []storage.TaskRepo
 	for _, r := range task.Repos {
-		n, err := p.Workspace.CommitsSince(ctx, r.WorktreePath, r.BaseCommit)
-		if err != nil {
-			return nil, fmt.Errorf("перевірка змін у %s: %w", r.RepoName, err)
-		}
-		if n > 0 {
+		if r.Commits > 0 {
 			changed = append(changed, r)
 		}
 	}
 	return changed, nil
-}
-
-// notifyJira пише в задачу коментар про результат. Помилка тут не
-// ламає задачу — код уже готовий, просто попереджаємо в лозі.
-func (p *Pipeline) notifyJira(ctx context.Context, task *storage.Task, changed []storage.TaskRepo, testReport string) {
-	names := make([]string, 0, len(changed))
-	for _, r := range changed {
-		names = append(names, r.RepoName)
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "🤖 Оркестратор виконав задачу.\n\nГілка: %s\nРепозиторії зі змінами: %s\nІтерацій рев'ю: %d\n",
-		task.BranchName, strings.Join(names, ", "), task.ReviewAttempts)
-	if task.ReviewAttempts >= task.MaxReviewAttempts {
-		b.WriteString("\n⚠️ Рев'ю не було схвалено за ліміт спроб — потрібна ручна перевірка. Останні зауваження:\n")
-		b.WriteString(truncate(task.LastFeedback, 3000))
-		b.WriteString("\n")
-	}
-	b.WriteString("\nЗвіт QA:\n")
-	b.WriteString(truncate(testReport, 5000))
-
-	if err := p.Jira.AddComment(ctx, task.ID, b.String()); err != nil {
-		slog.Warn("не вдалося оновити Jira", "key", task.ID, "error", err)
-	}
-}
-
-// truncate обрізає текст до max символів.
-// Працюємо з []rune (символи), а не з байтами: кирилиця займає 2 байти
-// на літеру, і різання по байтах зламало б текст посеред символу.
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max]) + "\n…(обрізано)"
 }

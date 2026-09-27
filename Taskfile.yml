@@ -21,6 +21,18 @@ tasks:
     cmds:
       - docker compose up -d --build
 
+  admin:
+    desc: Відкрити адмін-панель у браузері (http://localhost:3080)
+    cmds:
+      - open http://localhost:3080
+
+  admin:dev:
+    desc: Адмін-панель у режимі розробки з hot reload (http://localhost:5173, потрібен task up)
+    dir: admin
+    cmds:
+      - npm install
+      - npm run dev
+
   down:
     desc: Зупинити
     cmds:
@@ -37,6 +49,24 @@ tasks:
       vars: [KEY]
     cmds:
       - docker compose exec orchestrator orchestrator run {{.KEY}} {{if .REPO}}--repo {{.REPO}}{{end}}
+
+  watch:
+    desc: "Що агенти роблять прямо зараз: task watch KEY=PROJ-123 (Ctrl+C — вийти)"
+    requires:
+      vars: [KEY]
+    cmds:
+      - docker compose exec orchestrator tail -n 100 -F /tmp/workspaces/.logs/{{.KEY}}.log
+
+  changes:
+    desc: "Які файли змінено в репозиторіях задачі: task changes KEY=PROJ-123"
+    requires:
+      vars: [KEY]
+    cmds:
+      - |
+        docker compose exec orchestrator sh -c 'for d in /tmp/workspaces/{{.KEY}}/*/; do
+          s=$(git -C "$d" status --short); c=$(git -C "$d" log --oneline --grep="^{{.KEY}}:")
+          [ -n "$s$c" ] && printf "== %s\n%s\n%s\n" "$(basename "$d")" "$c" "$s"
+        done; true'
 
   status:
     desc: "Стан задач (усіх або однієї: task status KEY=PROJ-123)"

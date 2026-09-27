@@ -8,7 +8,7 @@ server:
 database:
   # Якщо задано DATABASE_URL (так робить docker-compose) — поля нижче ігноруються.
   host: "localhost"
-  port: 5432
+  port: 5433   # порт Postgres з docker-compose на Mac (для локального go run)
   user: "orchestrator"
   password: "orchestrator_secret_password"
   dbname: "orchestrator_db"
@@ -45,5 +45,5 @@ roles:
     # З Jira працює сам Claude Code через Jira MCP (mcp-atlassian, встановлено в Docker-образі).
     # Доступ до Jira — змінні JIRA_URL / JIRA_USERNAME / JIRA_API_TOKEN з .env.
     cli_flags: ["--dangerously-skip-permissions", "--mcp-config", "/app/mcp/jira.json", "--strict-mcp-config"]
-    model: "haiku"   # лише прочитати задачу і написати коментар — велика модель не потрібна
+    model: "haiku"   # лише прочитати задачу — велика модель не потрібна
     system_instruction: "Ти працюєш з Jira виключно через інструменти Jira MCP. Нічого не вигадуй: якщо інструмент повернув помилку — так і скажи."

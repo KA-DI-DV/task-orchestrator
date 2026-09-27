@@ -61,11 +61,18 @@ task run KEY=https://acme.atlassian.net/browse/PROJ-123
 # або те саме без task:
 docker compose exec orchestrator orchestrator run PROJ-123
 
+task watch KEY=PROJ-123              # що агенти роблять прямо зараз (живий журнал)
+task changes KEY=PROJ-123            # коміти та незакомічені зміни в репозиторіях задачі
 task status                          # усі задачі
 task status KEY=PROJ-123             # одна задача детально
 docker compose exec orchestrator orchestrator logs PROJ-123     # що робили агенти
 docker compose exec orchestrator orchestrator resume PROJ-123   # продовжити/перезапустити
 ```
+
+**Що робить агент.** Оркестратор запускає `claude --output-format stream-json` і кожну дію
+агента (🔧 виклик інструмента, 💬 текст, ⚠️ помилка інструмента) одразу пише в лог і у файл
+`/tmp/workspaces/.logs/<KEY>.log` — у ньому всі етапи задачі підряд. `task watch` показує цей файл.
+Після кожного етапу той самий журнал разом з відповіддю агента зберігається в БД (`orchestrator logs`).
 
 Основний репозиторій можна змінити для окремої задачі: `REPO=billing-api` (`--repo billing-api`)
 або мітка `repo:billing-api` у Jira.

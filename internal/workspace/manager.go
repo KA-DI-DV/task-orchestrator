@@ -159,6 +159,24 @@ func (m *Manager) Remove(ctx context.Context, repoName, worktree string) error {
 	return nil
 }
 
+// Stats — підсумок змін задачі в репозиторії (для історії в БД):
+// скільки комітів, останній коміт і git diff --stat від base.
+func (m *Manager) Stats(ctx context.Context, dir, base string) (commits int, head, diffStat string, err error) {
+	if commits, err = m.CommitsSince(ctx, dir, base); err != nil {
+		return 0, "", "", err
+	}
+	if head, err = git(ctx, dir, "rev-parse", "HEAD"); err != nil {
+		return 0, "", "", err
+	}
+	if commits > 0 {
+		// --stat=120 — ширина рядка, --stat-count=60 — не більше 60 файлів у списку.
+		if diffStat, err = git(ctx, dir, "diff", "--stat=120", "--stat-count=60", base+"..HEAD"); err != nil {
+			return 0, "", "", err
+		}
+	}
+	return commits, head, diffStat, nil
+}
+
 // DeleteBranchIfEmpty видаляє гілку, якщо в ній немає комітів після base.
 // Так у репозиторіях, які задача не зачепила, не лишається порожніх гілок.
 // Викликати лише після Remove: гілку, з якою пов'язаний worktree, git видалити не дасть.

@@ -178,8 +178,16 @@ func logsCmd(configPath *string) *cobra.Command {
 				return err
 			}
 			for _, l := range logs {
-				fmt.Printf("\n━━━━━━ #%d %s (%s) %s ━━━━━━\n%s\n",
-					l.ID, l.StepName, l.AgentRole, l.CreatedAt.Local().Format("15:04:05"), l.OutputLog)
+				fmt.Printf("\n━━━━━━ #%d %s (%s) ітерація %d — %s · %s · $%.2f ━━━━━━\n",
+					l.ID, l.StepName, l.AgentRole, l.Iteration, l.Verdict,
+					l.CreatedAt.Local().Format("15:04:05"), l.CostUSD)
+				fmt.Printf("%s\n", l.Summary)
+				if l.Feedback != "" {
+					fmt.Printf("\n--- review_feedback.md ---\n%s\n", l.Feedback)
+				}
+				if l.OutputLog != "" {
+					fmt.Printf("\n--- журнал дій ---\n%s\n", l.OutputLog)
+				}
 			}
 			return nil
 		},

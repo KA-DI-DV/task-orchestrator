@@ -23,6 +23,13 @@ const (
 	testFailed     = "FAILED"
 )
 
+// Вердикти в історії задачі (task_logs.verdict), крім наведених вище.
+const (
+	verdictDone        = "DONE"        // Developer завершив ітерацію
+	verdictError       = "ERROR"       // агент або оркестратор завершився помилкою
+	verdictInterrupted = "INTERRUPTED" // задачу зупинили (Ctrl+C / зупинка контейнера)
+)
+
 func taskHeader(t *storage.Task) string {
 	return fmt.Sprintf("Задача Jira %s: %s\n\nОпис задачі:\n%s\n", t.ID, t.Title, t.Description)
 }

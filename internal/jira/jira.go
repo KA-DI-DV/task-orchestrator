@@ -1,4 +1,4 @@
-// Package jira — отримання даних задачі з Jira та запис коментарів.
+// Package jira — отримання даних задачі з Jira.
 //
 // Оркестратор сам у Jira не ходить: з Jira працює Claude Code через
 // Jira MCP (див. MCPClient і mcp/jira.json).
@@ -27,7 +27,6 @@ type Issue struct {
 // (не треба писати implements, як у Java/TypeScript).
 type Client interface {
 	GetIssue(ctx context.Context, key string) (*Issue, error)
-	AddComment(ctx context.Context, key, text string) error
 }
 
 // issueKeyRe шукає ключ задачі: великі літери/цифри, дефіс, число. Напр. PROJ-123.

@@ -48,8 +48,15 @@ type Task struct {
 	Description       string    `db:"description" json:"description"`
 	BaseCommit        string    `db:"base_commit" json:"base_commit"`
 	LastError         string    `db:"last_error" json:"last_error"`
+	TestReport        string    `db:"test_report" json:"test_report"`
 	CreatedAt         time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt         time.Time `db:"updated_at" json:"updated_at"`
+	// *time.Time — вказівник, бо значення може бути NULL (задача ще не завершена).
+	CompletedAt *time.Time `db:"completed_at" json:"completed_at"`
+
+	// Обчислювані поля (підзапити в taskColumns) — для списку задач.
+	TotalCostUSD float64 `db:"total_cost_usd" json:"total_cost_usd"`
+	ChangedRepos int     `db:"changed_repos" json:"changed_repos"`
 
 	// Усі репозиторії задачі (таблиця task_repos). db:"-" — pgx не шукає
 	// таку колонку в tasks, заповнюємо окремим запитом.
@@ -62,6 +69,9 @@ type TaskRepo struct {
 	WorktreePath string `db:"worktree_path" json:"worktree_path"`
 	BaseCommit   string `db:"base_commit" json:"base_commit"`
 	IsMain       bool   `db:"is_main" json:"is_main"`
+	Commits      int    `db:"commits" json:"commits"`         // комітів задачі в гілці
+	HeadCommit   string `db:"head_commit" json:"head_commit"` // останній коміт гілки
+	DiffStat     string `db:"diff_stat" json:"diff_stat"`     // git diff --stat від base
 }
 
 // MainRepo повертає основний репозиторій задачі (або nil, якщо його немає).
@@ -74,14 +84,22 @@ func (t *Task) MainRepo() *TaskRepo {
 	return nil
 }
 
-// TaskLog — один рядок таблиці task_logs.
+// TaskLog — один рядок таблиці task_logs: один запуск агента.
 type TaskLog struct {
-	ID        int64     `db:"id" json:"id"`
-	TaskID    string    `db:"task_id" json:"task_id"`
-	StepName  string    `db:"step_name" json:"step_name"`
-	AgentRole string    `db:"agent_role" json:"agent_role"`
-	OutputLog string    `db:"output_log" json:"output_log"`
-	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	ID         int64     `db:"id" json:"id"`
+	TaskID     string    `db:"task_id" json:"task_id"`
+	StepName   string    `db:"step_name" json:"step_name"`
+	AgentRole  string    `db:"agent_role" json:"agent_role"`
+	Iteration  int       `db:"iteration" json:"iteration"`
+	Verdict    string    `db:"verdict" json:"verdict"`
+	Prompt     string    `db:"prompt" json:"prompt"`
+	Summary    string    `db:"summary" json:"summary"`
+	Feedback   string    `db:"feedback" json:"feedback"`
+	CostUSD    float64   `db:"cost_usd" json:"cost_usd"`
+	NumTurns   int       `db:"num_turns" json:"num_turns"`
+	DurationMS int64     `db:"duration_ms" json:"duration_ms"`
+	OutputLog  string    `db:"output_log" json:"output_log"` // журнал дій агента + stderr
+	CreatedAt  time.Time `db:"created_at" json:"created_at"` // коли запуск завершився
 }
 
 // ErrNotFound повертається, коли задачі з таким ключем немає.
@@ -97,7 +115,9 @@ const taskColumns = `
 	COALESCE(last_feedback, '') AS last_feedback,
 	title, description, base_commit,
 	COALESCE(last_error, '') AS last_error,
-	created_at, updated_at`
+	test_report, created_at, updated_at, completed_at,
+	(SELECT COALESCE(SUM(l.cost_usd), 0) FROM task_logs l WHERE l.task_id = tasks.id) AS total_cost_usd,
+	(SELECT COUNT(*) FROM task_repos r WHERE r.task_id = tasks.id AND r.commits > 0) AS changed_repos`
 
 // CreateTask додає нову задачу разом з її репозиторіями. Якщо задача
 // з таким ID вже існує — повертає помилку (щоб випадково не запустити
@@ -142,7 +162,7 @@ func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 
 	// Основний репозиторій — першим, решта за алфавітом.
 	rows, err = s.pool.Query(ctx, `
-		SELECT repo_name, worktree_path, base_commit, is_main
+		SELECT repo_name, worktree_path, base_commit, is_main, commits, head_commit, diff_stat
 		FROM task_repos WHERE task_id = $1 ORDER BY is_main DESC, repo_name`, id)
 	if err != nil {
 		return nil, err
@@ -175,10 +195,13 @@ func (s *Store) SaveTask(ctx context.Context, t *Task) error {
 				description = $7,
 				base_commit = $8,
 				last_error = NULLIF($9, ''),
+				test_report = $10,
+				completed_at = $11,
 				updated_at = now()
 			WHERE id = $1`,
 			t.ID, t.Status, t.WorktreePath, t.ReviewAttempts, t.LastFeedback,
 			t.Title, t.Description, t.BaseCommit, t.LastError,
+			t.TestReport, t.CompletedAt,
 		)
 		if err != nil {
 			return err
@@ -196,13 +219,18 @@ func (s *Store) SaveTask(ctx context.Context, t *Task) error {
 func saveRepos(ctx context.Context, tx pgx.Tx, t *Task) error {
 	for _, r := range t.Repos {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO task_repos (task_id, repo_name, worktree_path, base_commit, is_main)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO task_repos (task_id, repo_name, worktree_path, base_commit, is_main,
+			                        commits, head_commit, diff_stat)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (task_id, repo_name) DO UPDATE SET
 				worktree_path = EXCLUDED.worktree_path,
 				base_commit   = EXCLUDED.base_commit,
-				is_main       = EXCLUDED.is_main`,
-			t.ID, r.RepoName, r.WorktreePath, r.BaseCommit, r.IsMain)
+				is_main       = EXCLUDED.is_main,
+				commits       = EXCLUDED.commits,
+				head_commit   = EXCLUDED.head_commit,
+				diff_stat     = EXCLUDED.diff_stat`,
+			t.ID, r.RepoName, r.WorktreePath, r.BaseCommit, r.IsMain,
+			r.Commits, r.HeadCommit, r.DiffStat)
 		if err != nil {
 			return fmt.Errorf("репозиторій %s: %w", r.RepoName, err)
 		}
@@ -210,18 +238,22 @@ func saveRepos(ctx context.Context, tx pgx.Tx, t *Task) error {
 	return nil
 }
 
-// AddLog записує лог роботи агента.
-func (s *Store) AddLog(ctx context.Context, taskID, step, role, output string) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO task_logs (task_id, step_name, agent_role, output_log) VALUES ($1, $2, $3, $4)`,
-		taskID, step, role, output)
+// AddLog записує один запуск агента в історію задачі.
+func (s *Store) AddLog(ctx context.Context, l *TaskLog) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO task_logs (task_id, step_name, agent_role, iteration, verdict, prompt,
+		                       summary, feedback, cost_usd, num_turns, duration_ms, output_log)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		l.TaskID, l.StepName, l.AgentRole, l.Iteration, l.Verdict, l.Prompt,
+		l.Summary, l.Feedback, l.CostUSD, l.NumTurns, l.DurationMS, l.OutputLog)
 	return err
 }
 
 // ListLogs повертає всі логи задачі в хронологічному порядку.
 func (s *Store) ListLogs(ctx context.Context, taskID string) ([]*TaskLog, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, task_id, step_name, agent_role, COALESCE(output_log, '') AS output_log, created_at
+		SELECT id, task_id, step_name, agent_role, iteration, verdict, prompt, summary, feedback,
+		       cost_usd, num_turns, duration_ms, COALESCE(output_log, '') AS output_log, created_at
 		FROM task_logs WHERE task_id = $1 ORDER BY id`, taskID)
 	if err != nil {
 		return nil, err
