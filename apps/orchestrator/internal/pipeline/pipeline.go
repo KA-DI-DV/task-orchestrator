@@ -12,7 +12,8 @@
 //
 // Кожен етап — окрема функція, яка змінює task.Status. Після кожного етапу
 // стан зберігається в PostgreSQL. Тому якщо контейнер впаде, задачу можна
-// продовжити з того самого місця командою `orchestrator resume PROJ-123`.
+// продовжити з того самого місця кнопкою «Продовжити» в адмін-панелі
+// (POST /api/tasks/{id}/resume).
 package pipeline
 
 import (
@@ -79,8 +80,8 @@ func (p *Pipeline) Start(ctx context.Context, jiraInput, repoName string) (*stor
 	existing, err := p.Store.GetTask(ctx, key)
 	switch {
 	case err == nil:
-		return nil, fmt.Errorf("задача %s вже існує (статус %s). Щоб продовжити: orchestrator resume %s",
-			key, existing.Status, key)
+		return nil, fmt.Errorf("задача %s вже існує (статус %s). Щоб продовжити — відкрий її в адмін-панелі і натисни «Продовжити»",
+			key, existing.Status)
 	case !errors.Is(err, storage.ErrNotFound):
 		return nil, err
 	}

@@ -63,4 +63,4 @@ RUN mkdir -p /tmp/workspaces /home/node/.claude && chown -R node:node /tmp/works
 USER node
 
 EXPOSE 8080
-CMD ["orchestrator", "serve"]
+CMD ["orchestrator"]

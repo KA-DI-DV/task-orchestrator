@@ -3,7 +3,7 @@
 #
 #   task                              — список команд
 #   task up                           — зібрати і запустити все в Docker
-#   task run KEY=PROJ-123
+#   task admin                        — відкрити адмін-панель (задачі запускаються там)
 #
 # Змінна називається KEY, а не TASK: TASK у Taskfile зарезервована
 # (це назва поточної команди).
@@ -43,13 +43,6 @@ tasks:
     cmds:
       - docker compose logs -f orchestrator
 
-  run:
-    desc: "Виконати задачу: task run KEY=PROJ-123 [REPO=основний-репо, за замовчуванням main_repo]"
-    requires:
-      vars: [KEY]
-    cmds:
-      - docker compose exec orchestrator orchestrator run {{.KEY}} {{if .REPO}}--repo {{.REPO}}{{end}}
-
   watch:
     desc: "Що агенти роблять прямо зараз: task watch KEY=PROJ-123 (Ctrl+C — вийти)"
     requires:
@@ -67,11 +60,6 @@ tasks:
           s=$(git -C "$d" status --short); c=$(git -C "$d" log --oneline --grep="^{{.KEY}}:")
           [ -n "$s$c" ] && printf "== %s\n%s\n%s\n" "$(basename "$d")" "$c" "$s"
         done; true'
-
-  status:
-    desc: "Стан задач (усіх або однієї: task status KEY=PROJ-123)"
-    cmds:
-      - docker compose exec orchestrator orchestrator status {{.KEY}}
 
   test:
     desc: Запустити Go-тести (в Docker, локальний Go не потрібен)

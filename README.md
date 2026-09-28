@@ -6,7 +6,7 @@
 Стан зберігається в PostgreSQL.
 
 ```
-orchestrator run PROJ-123
+Адмінка → «Нова задача» PROJ-123
   │
   ├─ CREATED    читає задачу з Jira, створює worktree + гілку feature/PROJ-123
   │             у кожному репозиторії: /tmp/workspaces/PROJ-123/<repo>
@@ -29,7 +29,7 @@ orchestrator run PROJ-123
 ```
 .
 ├── apps/                          # Усі застосунки
-│   ├── orchestrator/              # Go-сервіс: конвеєр агентів, CLI, REST API
+│   ├── orchestrator/              # Go-сервіс: конвеєр агентів + REST API
 │   │   ├── cmd/orchestrator/      # точка входу (main.go)
 │   │   ├── internal/              # логіка: pipeline, agent, storage, jira, ...
 │   │   ├── mcp/                   # конфіги MCP-серверів (Browser, Jira)
@@ -37,14 +37,14 @@ orchestrator run PROJ-123
 │   │   ├── Dockerfile
 │   │   └── go.mod                 # власний go.mod
 │   │
-│   └── admin/                     # React-адмінка (Vite), nginx проксує /api до оркестратора
+│   └── admin/                     # React-адмінка (Vite): звідси запускаються задачі
 │       ├── src/
 │       ├── Dockerfile
 │       ├── package.json
 │       └── vite.config.ts
 │
 ├── docker-compose.yml             # локальний запуск усього: postgres + orchestrator + admin
-├── Taskfile.yml                   # єдина точка керування проєктом (task up, task run, ...)
+├── Taskfile.yml                   # єдина точка керування проєктом (task up, task admin, ...)
 ├── .env.example                   # змінні оточення (спільні для docker-compose)
 └── README.md
 ```
@@ -85,29 +85,30 @@ curl localhost:8080/healthz # {"status":"ok"}
 
 ## 2. Запуск задачі
 
-```bash
-# CLI (виконується до кінця, логи видно одразу)
-task run KEY=https://acme.atlassian.net/browse/PROJ-123
-# або те саме без task:
-docker compose exec orchestrator orchestrator run PROJ-123
+Задачі запускаються **лише через адмін-панель**: `task admin` → http://localhost:3080.
 
-task watch KEY=PROJ-123              # що агенти роблять прямо зараз (живий журнал)
+- **«Нова задача»** — посилання на Jira або ключ (`PROJ-123`) і, за бажанням, основний репозиторій;
+- **сторінка задачі** — статус, етапи, фідбек рев'юера, звіт QA, вартість і живий журнал агентів;
+- **«Продовжити» / «Перезапустити»** — після перезапуску контейнера або для FAILED-задачі
+  (звіт QA стає фідбеком для Developer'а).
+
+Для діагностики з терміналу:
+
+```bash
+task watch KEY=PROJ-123              # живий журнал агентів (те саме, що в адмінці)
 task changes KEY=PROJ-123            # коміти та незакомічені зміни в репозиторіях задачі
-task status                          # усі задачі
-task status KEY=PROJ-123             # одна задача детально
-docker compose exec orchestrator orchestrator logs PROJ-123     # що робили агенти
-docker compose exec orchestrator orchestrator resume PROJ-123   # продовжити/перезапустити
+task logs                            # логи самого оркестратора
 ```
 
 **Що робить агент.** Оркестратор запускає `claude --output-format stream-json` і кожну дію
 агента (🔧 виклик інструмента, 💬 текст, ⚠️ помилка інструмента) одразу пише в лог і у файл
 `/tmp/workspaces/.logs/<KEY>.log` — у ньому всі етапи задачі підряд. `task watch` показує цей файл.
-Після кожного етапу той самий журнал разом з відповіддю агента зберігається в БД (`orchestrator logs`).
+Після кожного етапу той самий журнал разом з відповіддю агента зберігається в БД — його видно на сторінці задачі в адмінці.
 
-Основний репозиторій можна змінити для окремої задачі: `REPO=billing-api` (`--repo billing-api`)
-або мітка `repo:billing-api` у Jira.
+Основний репозиторій можна змінити для окремої задачі: вибрати його в діалозі «Нова задача»
+або поставити мітку `repo:billing-api` у Jira.
 
-REST API (задача виконується у фоні):
+REST API, яким користується адмінка (задача виконується у фоні):
 
 ```bash
 curl -X POST localhost:8080/api/tasks -d '{"jira_url":"PROJ-123"}'
@@ -129,7 +130,7 @@ curl -X POST localhost:8080/api/tasks/PROJ-123/resume
 
 | # | Файл | Що там |
 |---|------|--------|
-| 1 | `cmd/orchestrator/main.go` | CLI-команди (`run`, `resume`, `status`, `logs`, `serve`) |
+| 1 | `cmd/orchestrator/main.go` | Точка входу: читає `CONFIG_PATH` і запускає сервер |
 | 2 | `cmd/orchestrator/app.go` | Збирає всі частини докупи, запускає HTTP-сервер |
 | 3 | `internal/config/config.go` | Читання `config.yaml` + змінних оточення |
 | 4 | `internal/storage/` | PostgreSQL: міграції (`migrations/*.sql`) і запити до таблиць |
@@ -165,7 +166,6 @@ curl -X POST localhost:8080/api/tasks/PROJ-123/resume
 - **Go 1.27**, лише стандартна бібліотека для HTTP (`net/http` з роутингом `GET /api/tasks/{id}`),
   логування (`log/slog`) і процесів (`os/exec`);
 - **pgx v5** — драйвер PostgreSQL, без ORM, звичайний SQL;
-- **cobra** — CLI-команди (використовують kubectl, docker, gh);
 - **goccy/go-yaml** — читання YAML;
 - **PostgreSQL 18**, **Node 24 + Debian 13 (trixie)**, **Claude Code CLI**, **Playwright MCP + Chromium**.
 
@@ -179,7 +179,7 @@ Go ставити не обов'язково: `task test` запускає те�
 brew install go
 cd apps/orchestrator
 go test ./...
-go run ./cmd/orchestrator status --config config.yaml   # потрібен запущений postgres
+go run ./cmd/orchestrator   # REST API на :8080, потрібен запущений postgres (task up)
 ```
 
 Корисні команди Go: `go build ./...` (зібрати), `go vet ./...` (статичний аналіз),
@@ -213,6 +213,7 @@ go run ./cmd/orchestrator status --config config.yaml   # потрібен за�
 | Додані колонки `title`, `description`, `base_commit`, `last_error` | Щоб `resume` працював без повторного запиту в Jira, а рев'юер бачив diff від правильного коміту |
 | Маркери `VERDICT: APPROVE` / `TEST_RESULT: PASSED` в останньому рядку | Слово "APPROVE" може трапитися всередині тексту ("не можу APPROVE") — маркер надійніший. Просто `APPROVE` останнім рядком теж зараховується |
 | Оркестратор сам комітить зміни після кожного етапу | Інакше при видаленні worktree код би зник |
-| Команда `resume` | Продовжити після перезапуску контейнера або перезапустити FAILED-задачу (звіт QA стає фідбеком для Developer'а) |
+| Кнопка «Продовжити» (`resume`) | Продовжити після перезапуску контейнера або перезапустити FAILED-задачу (звіт QA стає фідбеком для Developer'а) |
 | Прибрано `network_mode: "bridge"` з compose | З ним контейнер не бачить сервіс `postgres` за іменем |
 | Postgres 18, Go 1.27, Node 24, Debian trixie | Актуальні версії; для Postgres 18 volume монтується в `/var/lib/postgresql` |
+| Немає CLI — лише REST API + адмін-панель | Один спосіб запуску задач: pipeline виконується тільки в сервері, стан видно в UI |
