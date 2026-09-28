@@ -28,7 +28,7 @@ tasks:
 
   admin:dev:
     desc: Адмін-панель у режимі розробки з hot reload (http://localhost:5173, потрібен task up)
-    dir: admin
+    dir: apps/admin
     cmds:
       - npm install
       - npm run dev
@@ -76,4 +76,4 @@ tasks:
   test:
     desc: Запустити Go-тести (в Docker, локальний Go не потрібен)
     cmds:
-      - docker run --rm -v "{{.ROOT_DIR}}":/src -w /src golang:1.27-trixie go test ./...
+      - docker run --rm -v "{{.ROOT_DIR}}/apps/orchestrator":/src -w /src golang:1.27-trixie go test ./...

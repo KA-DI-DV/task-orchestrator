@@ -21,6 +21,36 @@ orchestrator run PROJ-123
 
 ---
 
+## Структура репозиторію
+
+Монорепо: кожен застосунок — окрема папка в `apps/` зі своїм Dockerfile і залежностями.
+Усе, що стосується всього проєкту разом, лежить у корені.
+
+```
+.
+├── apps/                          # Усі застосунки
+│   ├── orchestrator/              # Go-сервіс: конвеєр агентів, CLI, REST API
+│   │   ├── cmd/orchestrator/      # точка входу (main.go)
+│   │   ├── internal/              # логіка: pipeline, agent, storage, jira, ...
+│   │   ├── mcp/                   # конфіги MCP-серверів (Browser, Jira)
+│   │   ├── config.yaml            # налаштування оркестратора
+│   │   ├── Dockerfile
+│   │   └── go.mod                 # власний go.mod
+│   │
+│   └── admin/                     # React-адмінка (Vite), nginx проксує /api до оркестратора
+│       ├── src/
+│       ├── Dockerfile
+│       ├── package.json
+│       └── vite.config.ts
+│
+├── docker-compose.yml             # локальний запуск усього: postgres + orchestrator + admin
+├── Taskfile.yml                   # єдина точка керування проєктом (task up, task run, ...)
+├── .env.example                   # змінні оточення (спільні для docker-compose)
+└── README.md
+```
+
+---
+
 ## 1. Швидкий старт (Docker)
 
 Короткі команди описані в `Taskfile.yml` ([Task](https://taskfile.dev), встановити: `brew install go-task`).
@@ -40,12 +70,12 @@ curl localhost:8080/healthz # {"status":"ok"}
 
 **Jira.** Оркестратор сам у Jira не ходить: задачу читає і коментар пише Claude Code
 через Jira MCP ([mcp-atlassian](https://github.com/sooperset/mcp-atlassian), встановлено в образі,
-конфіг — `mcp/jira.json`, роль `jira` у `config.yaml`). Потрібні `JIRA_URL` і
+конфіг — `apps/orchestrator/mcp/jira.json`, роль `jira` у `config.yaml`). Потрібні `JIRA_URL` і
 `JIRA_USERNAME` + `JIRA_API_TOKEN` (Jira Cloud) або `JIRA_PERSONAL_TOKEN` (Server/Data Center).
 
 **Репозиторії.** `REPOS_DIR` у `.env` — папка на Mac, де лежать репозиторії
 (наприклад `~/Projects`). Вона монтується в контейнер як `/workspaces`.
-У `config.yaml`:
+У `apps/orchestrator/config.yaml`:
 
 - `main_repo` — репозиторій, у якому запускається claude (зараз `game-rgs-backend`);
 - `exclude_repos` — для них worktree не створюється (зараз фронт: `game-client`, `game-configurator`).
@@ -94,6 +124,7 @@ curl -X POST localhost:8080/api/tasks/PROJ-123/resume
 
 ## 3. Як читати код
 
+Код оркестратора лежить в `apps/orchestrator/`, шляхи нижче — відносно цієї папки.
 Читай у такому порядку, від простого до головного:
 
 | # | Файл | Що там |
@@ -146,12 +177,15 @@ Go ставити не обов'язково: `task test` запускає те�
 
 ```bash
 brew install go
+cd apps/orchestrator
 go test ./...
 go run ./cmd/orchestrator status --config config.yaml   # потрібен запущений postgres
 ```
 
 Корисні команди Go: `go build ./...` (зібрати), `go vet ./...` (статичний аналіз),
 `gofmt -w .` (форматування — в Go воно єдине для всіх, сперечатися не треба).
+
+Адмінка з hot reload: `task admin:dev` (або `cd apps/admin && npm install && npm run dev`) → http://localhost:5173.
 
 ---
 
@@ -166,9 +200,9 @@ go run ./cmd/orchestrator status --config config.yaml   # потрібен за�
 - `~/.claude` з Mac змонтовано в контейнер: агенти бачать твої глобальні CLAUDE.md, skills і agents.
 - Правила конкретного репозиторію (CLAUDE.md, `.mcp.json`, `.claude/`) Claude Code підхоплює сам,
   бо запускається всередині worktree цього репозиторію.
-- Browser MCP для тестувальника підключається через `mcp/browser.json`
+- Browser MCP для тестувальника підключається через `apps/orchestrator/mcp/browser.json`
   (`--mcp-config` у `config.yaml`, роль `tester`).
-- Jira MCP підключається лише для ролі `jira` (`mcp/jira.json` + `--strict-mcp-config`),
+- Jira MCP підключається лише для ролі `jira` (`apps/orchestrator/mcp/jira.json` + `--strict-mcp-config`),
   дозволені тільки інструменти `jira_get_issue` і `jira_add_comment` (`ENABLED_TOOLS`).
   Агенти Developer/Reviewer/QA доступу до Jira не мають.
 

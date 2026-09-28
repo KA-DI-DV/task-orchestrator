@@ -1,3 +1,4 @@
-/orchestrator
-/bin/
 .env
+.DS_Store
+/apps/orchestrator/orchestrator
+/apps/orchestrator/bin/

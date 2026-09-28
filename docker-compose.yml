@@ -18,7 +18,7 @@ services:
       retries: 5
 
   orchestrator:
-    build: .
+    build: ./apps/orchestrator
     container_name: orchestrator_app
     depends_on:
       postgres:
@@ -41,13 +41,13 @@ services:
       # Налаштування Claude Code з Mac (глобальні CLAUDE.md, skills, agents).
       - ~/.claude:/home/node/.claude
       # Конфіг і MCP можна міняти без перезбирання образу.
-      - ./config.yaml:/app/config.yaml:ro
-      - ./mcp:/app/mcp:ro
+      - ./apps/orchestrator/config.yaml:/app/config.yaml:ro
+      - ./apps/orchestrator/mcp:/app/mcp:ro
     restart: unless-stopped
 
   # Адмін-панель (React). nginx роздає зібраний застосунок і проксує /api до оркестратора.
   admin:
-    build: ./admin
+    build: ./apps/admin
     container_name: orchestrator_admin
     depends_on:
       - orchestrator
