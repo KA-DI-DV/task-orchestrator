@@ -17,17 +17,25 @@ import (
 type Status string
 
 const (
-	StatusCreated   Status = "CREATED"
-	StatusInDev     Status = "IN_DEV"
-	StatusInReview  Status = "IN_REVIEW"
-	StatusInTest    Status = "IN_TEST"
-	StatusCompleted Status = "COMPLETED"
-	StatusFailed    Status = "FAILED"
+	StatusCreated    Status = "CREATED"
+	StatusInPlanning Status = "IN_PLANNING" // Архітектор складає план
+	StatusPlanReview Status = "PLAN_REVIEW" // план чекає на рішення людини
+	StatusInDev      Status = "IN_DEV"
+	StatusInReview   Status = "IN_REVIEW"
+	StatusInTest     Status = "IN_TEST"
+	StatusCompleted  Status = "COMPLETED"
+	StatusFailed     Status = "FAILED"
 )
 
 // IsFinal каже, чи задача вже завершилась (успішно чи ні).
 func (s Status) IsFinal() bool {
 	return s == StatusCompleted || s == StatusFailed
+}
+
+// IsWaiting каже, що задача чекає на людину: агенти нічого не роблять,
+// доки план не схвалять або не напишуть до нього правки.
+func (s Status) IsWaiting() bool {
+	return s == StatusPlanReview
 }
 
 // Task — один рядок таблиці tasks.
@@ -53,6 +61,22 @@ type Task struct {
 	UpdatedAt         time.Time `db:"updated_at" json:"updated_at"`
 	// *time.Time — вказівник, бо значення може бути NULL (задача ще не завершена).
 	CompletedAt *time.Time `db:"completed_at" json:"completed_at"`
+
+	// Сесія агента поточного етапу (порожньо, якщо етап ще не почався
+	// або вже завершився) — щоб після зупинки відновити її, а не почати заново.
+	AgentRole    string `db:"agent_role" json:"agent_role"`
+	AgentSession string `db:"agent_session" json:"agent_session"`
+
+	// План від Архітектора (markdown) і рішення людини щодо нього.
+	Plan         string `db:"plan" json:"plan"`
+	PlanRevision int    `db:"plan_revision" json:"plan_revision"`
+	PlanFeedback string `db:"plan_feedback" json:"plan_feedback"` // правки до поточної версії
+	// NULL — план ще не схвалено: після (пере)запуску задача йде на планування.
+	PlanApprovedAt *time.Time `db:"plan_approved_at" json:"plan_approved_at"`
+
+	// Running — задачу зараз виконують агенти в цьому процесі. Не з БД:
+	// заповнює API з пам'яті конвеєра.
+	Running bool `db:"-" json:"running"`
 
 	// Обчислювані поля (підзапити в taskColumns) — для списку задач.
 	TotalCostUSD float64 `db:"total_cost_usd" json:"total_cost_usd"`
@@ -86,20 +110,23 @@ func (t *Task) MainRepo() *TaskRepo {
 
 // TaskLog — один рядок таблиці task_logs: один запуск агента.
 type TaskLog struct {
-	ID         int64     `db:"id" json:"id"`
-	TaskID     string    `db:"task_id" json:"task_id"`
-	StepName   string    `db:"step_name" json:"step_name"`
-	AgentRole  string    `db:"agent_role" json:"agent_role"`
-	Iteration  int       `db:"iteration" json:"iteration"`
-	Verdict    string    `db:"verdict" json:"verdict"`
-	Prompt     string    `db:"prompt" json:"prompt"`
-	Summary    string    `db:"summary" json:"summary"`
-	Feedback   string    `db:"feedback" json:"feedback"`
-	CostUSD    float64   `db:"cost_usd" json:"cost_usd"`
-	NumTurns   int       `db:"num_turns" json:"num_turns"`
-	DurationMS int64     `db:"duration_ms" json:"duration_ms"`
-	OutputLog  string    `db:"output_log" json:"output_log"` // журнал дій агента + stderr
-	CreatedAt  time.Time `db:"created_at" json:"created_at"` // коли запуск завершився
+	ID         int64   `db:"id" json:"id"`
+	TaskID     string  `db:"task_id" json:"task_id"`
+	StepName   string  `db:"step_name" json:"step_name"`
+	AgentRole  string  `db:"agent_role" json:"agent_role"`
+	Iteration  int     `db:"iteration" json:"iteration"`
+	Verdict    string  `db:"verdict" json:"verdict"`
+	Prompt     string  `db:"prompt" json:"prompt"`
+	Summary    string  `db:"summary" json:"summary"` // повна фінальна відповідь агента
+	Brief      string  `db:"brief" json:"brief"`     // підсумок кроку простою мовою
+	Feedback   string  `db:"feedback" json:"feedback"`
+	CostUSD    float64 `db:"cost_usd" json:"cost_usd"`
+	NumTurns   int     `db:"num_turns" json:"num_turns"`
+	DurationMS int64   `db:"duration_ms" json:"duration_ms"`
+	OutputLog  string  `db:"output_log" json:"output_log"` // журнал дій агента + stderr
+	// SessionNew / SessionResume / SessionContinue ("" — у старих записах).
+	SessionMode string    `db:"session_mode" json:"session_mode"`
+	CreatedAt   time.Time `db:"created_at" json:"created_at"` // коли запуск завершився
 }
 
 // ErrNotFound повертається, коли задачі з таким ключем немає.
@@ -115,7 +142,8 @@ const taskColumns = `
 	COALESCE(last_feedback, '') AS last_feedback,
 	title, description, base_commit,
 	COALESCE(last_error, '') AS last_error,
-	test_report, created_at, updated_at, completed_at,
+	test_report, created_at, updated_at, completed_at, agent_role, agent_session,
+	plan, plan_revision, plan_feedback, plan_approved_at,
 	(SELECT COALESCE(SUM(l.cost_usd), 0) FROM task_logs l WHERE l.task_id = tasks.id) AS total_cost_usd,
 	(SELECT COUNT(*) FROM task_repos r WHERE r.task_id = tasks.id AND r.commits > 0) AS changed_repos`
 
@@ -197,11 +225,18 @@ func (s *Store) SaveTask(ctx context.Context, t *Task) error {
 				last_error = NULLIF($9, ''),
 				test_report = $10,
 				completed_at = $11,
+				agent_role = $12,
+				agent_session = $13,
+				plan = $14,
+				plan_revision = $15,
+				plan_feedback = $16,
+				plan_approved_at = $17,
 				updated_at = now()
 			WHERE id = $1`,
 			t.ID, t.Status, t.WorktreePath, t.ReviewAttempts, t.LastFeedback,
 			t.Title, t.Description, t.BaseCommit, t.LastError,
-			t.TestReport, t.CompletedAt,
+			t.TestReport, t.CompletedAt, t.AgentRole, t.AgentSession,
+			t.Plan, t.PlanRevision, t.PlanFeedback, t.PlanApprovedAt,
 		)
 		if err != nil {
 			return err
@@ -212,6 +247,15 @@ func (s *Store) SaveTask(ctx context.Context, t *Task) error {
 		return fmt.Errorf("збереження задачі %s: %w", t.ID, err)
 	}
 	return nil
+}
+
+// SetAgentSession одразу записує сесію агента, який стартує, — ще до кінця
+// етапу: якщо процес впаде посеред роботи, сесію все одно можна буде відновити.
+func (s *Store) SetAgentSession(ctx context.Context, id, role, session string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tasks SET agent_role = $2, agent_session = $3, updated_at = now() WHERE id = $1`,
+		id, role, session)
+	return err
 }
 
 // saveRepos записує репозиторії задачі: новий — додає, наявний — оновлює
@@ -242,21 +286,36 @@ func saveRepos(ctx context.Context, tx pgx.Tx, t *Task) error {
 func (s *Store) AddLog(ctx context.Context, l *TaskLog) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO task_logs (task_id, step_name, agent_role, iteration, verdict, prompt,
-		                       summary, feedback, cost_usd, num_turns, duration_ms, output_log)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		                       summary, brief, feedback, cost_usd, num_turns, duration_ms, output_log,
+		                       session_mode)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		l.TaskID, l.StepName, l.AgentRole, l.Iteration, l.Verdict, l.Prompt,
-		l.Summary, l.Feedback, l.CostUSD, l.NumTurns, l.DurationMS, l.OutputLog)
+		l.Summary, l.Brief, l.Feedback, l.CostUSD, l.NumTurns, l.DurationMS, l.OutputLog,
+		l.SessionMode)
 	return err
 }
 
 // ListLogs повертає всі логи задачі в хронологічному порядку.
 func (s *Store) ListLogs(ctx context.Context, taskID string) ([]*TaskLog, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, task_id, step_name, agent_role, iteration, verdict, prompt, summary, feedback,
-		       cost_usd, num_turns, duration_ms, COALESCE(output_log, '') AS output_log, created_at
+		SELECT id, task_id, step_name, agent_role, iteration, verdict, prompt, summary, brief, feedback,
+		       cost_usd, num_turns, duration_ms, COALESCE(output_log, '') AS output_log, created_at, session_mode
 		FROM task_logs WHERE task_id = $1 ORDER BY id`, taskID)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowToAddrOfStructByName[TaskLog])
+}
+
+// DeleteTask видаляє задачу. Її логи й репозиторії (task_logs, task_repos)
+// видаляються разом з нею завдяки ON DELETE CASCADE.
+func (s *Store) DeleteTask(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM tasks WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("видалення задачі %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

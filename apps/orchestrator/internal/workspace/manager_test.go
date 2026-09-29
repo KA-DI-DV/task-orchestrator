@@ -102,3 +102,123 @@ func TestWorktreeLifecycle(t *testing.T) {
 		t.Error("migrations: порожня гілка мала бути видалена")
 	}
 }
+
+// Незамерджену гілку можна прибрати повністю, замерджену — MergedInto розпізнає.
+func TestMergedIntoAndPurge(t *testing.T) {
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+
+	ctx := context.Background()
+	base := t.TempDir()
+	newRepo(t, base, "backend")
+	m := &Manager{ReposBaseDir: base, WorktreesDir: t.TempDir()}
+	branch := BranchName("PROJ-1")
+	repo := m.RepoPath("backend")
+
+	path, baseCommit, _, err := m.Create(ctx, "backend", "PROJ-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Порожня гілка — не «замерджена».
+	if into, err := m.MergedInto(ctx, "backend", baseCommit, baseCommit); err != nil || into != "" {
+		t.Fatalf("порожня гілка: MergedInto = %q, %v", into, err)
+	}
+
+	_ = os.WriteFile(filepath.Join(path, "a.txt"), []byte("a"), 0o644)
+	if _, err := m.CommitAll(ctx, path, "feat"); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := git(ctx, repo, "rev-parse", branch)
+	if into, err := m.MergedInto(ctx, "backend", baseCommit, head); err != nil || into != "" {
+		t.Fatalf("незамерджена гілка: MergedInto = %q, %v", into, err)
+	}
+
+	// Мерджимо гілку в main — тепер видаляти не можна.
+	if _, err := git(ctx, repo, "merge", "-q", "--no-ff", "-m", "merge", branch); err != nil {
+		t.Fatal(err)
+	}
+	if into, err := m.MergedInto(ctx, "backend", baseCommit, head); err != nil || into != "main" {
+		t.Fatalf("замерджена гілка: MergedInto = %q, %v, очікував main", into, err)
+	}
+
+	// Purge прибирає worktree і гілку; за збереженим head мердж усе одно видно.
+	if err := m.Purge(ctx, "backend", path, branch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("worktree %s не видалено", path)
+	}
+	if branchExists(ctx, repo, branch) {
+		t.Errorf("гілку %s не видалено", branch)
+	}
+	if into, _ := m.MergedInto(ctx, "backend", baseCommit, head); into != "main" {
+		t.Errorf("за head: MergedInto = %q, очікував main", into)
+	}
+}
+
+// Гілку задачі, в якій задача нічого не комітила, створили поза оркестратором
+// від свіжого main (git branch feature/X main). Коміти main між base і гілкою —
+// не коміти задачі, тож задача не вважається замердженою.
+func TestMergedIntoIgnoresBranchRecreatedFromMain(t *testing.T) {
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+
+	ctx := context.Background()
+	base := t.TempDir()
+	newRepo(t, base, "backend")
+	m := &Manager{ReposBaseDir: base, WorktreesDir: t.TempDir()}
+	branch := BranchName("PROJ-2")
+	repo := m.RepoPath("backend")
+
+	baseCommit, _ := git(ctx, repo, "rev-parse", "HEAD")
+	// main пішов уперед (чужі коміти), гілку задачі створили від нього.
+	_ = os.WriteFile(filepath.Join(repo, "other.txt"), []byte("x"), 0o644)
+	if _, err := git(ctx, repo, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git(ctx, repo, "commit", "-q", "-m", "someone else's work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git(ctx, repo, "branch", branch, "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Оркестратор записав head == base: задача тут нічого не зробила.
+	if into, err := m.MergedInto(ctx, "backend", baseCommit, baseCommit); err != nil || into != "" {
+		t.Fatalf("MergedInto = %q, %v, очікував \"\"", into, err)
+	}
+}
+
+// DiscardChanges прибирає змінені й нові файли, але не чіпає коміти.
+func TestDiscardChanges(t *testing.T) {
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+
+	ctx := context.Background()
+	base := t.TempDir()
+	newRepo(t, base, "backend")
+	m := &Manager{ReposBaseDir: base, WorktreesDir: t.TempDir()}
+	path, _, _, err := m.Create(ctx, "backend", "PROJ-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if discarded, err := m.DiscardChanges(ctx, path); err != nil || discarded {
+		t.Fatalf("чистий worktree: DiscardChanges = %v, %v", discarded, err)
+	}
+
+	_ = os.WriteFile(filepath.Join(path, "new.txt"), []byte("x"), 0o644)
+	if discarded, err := m.DiscardChanges(ctx, path); err != nil || !discarded {
+		t.Fatalf("DiscardChanges = %v, %v, очікував true", discarded, err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "new.txt")); !os.IsNotExist(err) {
+		t.Error("новий файл не видалено")
+	}
+}

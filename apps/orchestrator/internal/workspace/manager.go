@@ -18,11 +18,13 @@ package workspace
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 type Manager struct {
@@ -149,6 +151,22 @@ func (m *Manager) CommitAll(ctx context.Context, worktree, message string) (bool
 	return true, nil
 }
 
+// DiscardChanges скасовує всі незакомічені зміни в worktree (змінені й нові
+// файли) і повертає, чи було що скасовувати. Коміти не чіпає.
+func (m *Manager) DiscardChanges(ctx context.Context, worktree string) (bool, error) {
+	status, err := git(ctx, worktree, "status", "--porcelain")
+	if err != nil || status == "" {
+		return false, err
+	}
+	if _, err := git(ctx, worktree, "reset", "--hard", "--quiet", "HEAD"); err != nil {
+		return false, err
+	}
+	if _, err := git(ctx, worktree, "clean", "-fdq"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Remove видаляє worktree. Гілка з комітами лишається в репозиторії —
 // її можна переглянути, запушити або створити з неї Pull Request.
 func (m *Manager) Remove(ctx context.Context, repoName, worktree string) error {
@@ -194,6 +212,90 @@ func (m *Manager) DeleteBranchIfEmpty(ctx context.Context, repoName, branch, bas
 	}
 	_, err = git(ctx, repo, "branch", "-D", branch)
 	return err
+}
+
+// mainRefs — гілки, які вважаємо «мейном»: коміти, що потрапили в будь-яку
+// з них, уже в основній лінії розробки.
+var mainRefs = []string{
+	"refs/heads/main", "refs/heads/master",
+	"refs/remotes/origin/main", "refs/remotes/origin/master",
+}
+
+// MergedInto перевіряє, чи коміти задачі вже потрапили в main.
+// Коміти задачі — це base..head, як їх записав оркестратор після етапів
+// агентів. На поточну гілку не дивимось: її могли створити чи пересунути
+// поза оркестратором (наприклад, `git checkout -b feature/X origin/main`),
+// і тоді в base..гілка опиняються чужі коміти з main — гілка виглядала б
+// «замердженою», хоча задача туди нічого не внесла.
+//
+// Повертає назву гілки, куди замерджено, або "", якщо ні (зокрема, якщо
+// задача не зробила в репозиторії жодного коміту — мерджити там нічого).
+//
+// Перед перевіркою пробуємо git fetch, щоб побачити мердж, зроблений на
+// GitHub/GitLab. Якщо fetch не вдався (немає мережі чи доступу) —
+// перевіряємо за тим, що є локально.
+func (m *Manager) MergedInto(ctx context.Context, repoName, base, head string) (string, error) {
+	repo := m.RepoPath(repoName)
+
+	if base == "" || head == "" || head == base {
+		return "", nil // задача нічого не комітила в цьому репозиторії
+	}
+	if _, err := git(ctx, repo, "cat-file", "-e", head+"^{commit}"); err != nil {
+		return "", nil // коміту вже немає в репозиторії — перевіряти нічого
+	}
+	out, err := git(ctx, repo, "rev-list", "--count", base+".."+head)
+	if err != nil {
+		return "", err
+	}
+	if out == "0" {
+		return "", nil
+	}
+
+	m.fetch(ctx, repo)
+	for _, ref := range mainRefs {
+		if _, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", ref); err != nil {
+			continue // такої гілки немає
+		}
+		// --is-ancestor: код виходу 0, якщо head є в історії ref.
+		if _, err := git(ctx, repo, "merge-base", "--is-ancestor", head, ref); err == nil {
+			return strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/remotes/"), nil
+		}
+	}
+	return "", nil
+}
+
+// fetch оновлює origin, не чекаючи довше 20 секунд і не питаючи пароль.
+func (m *Manager) fetch(ctx context.Context, repo string) {
+	if _, err := git(ctx, repo, "remote", "get-url", "origin"); err != nil {
+		return // віддаленого репозиторію немає
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "fetch", "--quiet", "origin")
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("git fetch не вдався, перевіряю мердж за локальними гілками",
+			"repo", repo, "error", err, "output", strings.TrimSpace(string(out)))
+	}
+}
+
+// Purge прибирає все, що задача лишила в репозиторії: worktree (якщо ще є)
+// і гілку разом з комітами. Незворотно — викликати лише для незамердженої задачі.
+func (m *Manager) Purge(ctx context.Context, repoName, worktree, branch string) error {
+	repo := m.RepoPath(repoName)
+	if _, err := os.Stat(worktree); err == nil {
+		if err := m.Remove(ctx, repoName, worktree); err != nil {
+			return err
+		}
+	}
+	_, _ = git(ctx, repo, "worktree", "prune")
+	if branchExists(ctx, repo, branch) {
+		if _, err := git(ctx, repo, "branch", "-D", branch); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func branchExists(ctx context.Context, repo, branch string) bool {

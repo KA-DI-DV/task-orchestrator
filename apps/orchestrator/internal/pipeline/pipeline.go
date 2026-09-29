@@ -1,23 +1,36 @@
 // Package pipeline — "мозок" оркестратора: скінченний автомат (FSM),
-// який проводить задачу через етапи Developer → Reviewer → QA.
+// який проводить задачу через етапи Architect → (людина) → Developer → Reviewer → QA.
 //
 // Схема переходів:
 //
-//	CREATED ──► IN_DEV ──► IN_REVIEW ──► APPROVE? ──так──► IN_TEST ──► COMPLETED
-//	               ▲            │                              │
-//	               │            ні: review_attempts++          └──► FAILED
-//	               │            │
-//	               └── < max ───┤
-//	                            └── >= max ──► IN_TEST (форсовано, з попередженням)
+//	CREATED ──► IN_PLANNING ──► PLAN_REVIEW ──схвалено──► IN_DEV ...
+//	                 ▲               │
+//	                 └──── правки ───┘   (чекаємо на людину: агенти не працюють)
+//
+//	IN_DEV ──► IN_REVIEW ──► APPROVE? ──так──► IN_TEST ──► COMPLETED
+//	   ▲            │                              │
+//	   │            ні: review_attempts++          └──► FAILED
+//	   │            │
+//	   └── < max ───┤
+//	                └── >= max ──► IN_TEST (форсовано, з попередженням)
+//
+// У PLAN_REVIEW Run виходить і задача стоїть, доки людина в адмін-панелі не
+// натисне «Схвалити» (ApprovePlan) або не надішле правки (RevisePlan).
 //
 // Кожен етап — окрема функція, яка змінює task.Status. Після кожного етапу
 // стан зберігається в PostgreSQL. Тому якщо контейнер впаде, задачу можна
 // продовжити з того самого місця кнопкою «Продовжити» в адмін-панелі
 // (POST /api/tasks/{id}/resume).
+//
+// Задачу можна зупинити (POST /api/tasks/{id}/stop): агента, що працює, м'яко
+// завершуємо, статус лишається тим самим етапом. Id сесії claude зберігається
+// в БД ще до старту агента, тож «Продовжити» відновлює ту саму сесію
+// (claude --resume) — агент бачить усе, що встиг зробити, і доробляє етап.
 package pipeline
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +50,8 @@ import (
 
 // Назви етапів для таблиці task_logs.
 const (
+	stepPlanning    = "PLANNING"
+	stepPlanReview  = "PLAN_REVIEW" // рішення людини щодо плану
 	stepDevelopment = "DEVELOPMENT"
 	stepReview      = "REVIEW"
 	stepTesting     = "TESTING"
@@ -60,9 +75,40 @@ type Pipeline struct {
 	MainRepo        string   // основний репозиторій за замовчуванням
 	ExcludeRepos    []string // репозиторії, для яких не створюється worktree
 
-	// running — які задачі зараз виконуються в цьому процесі.
-	// sync.Map — потокобезпечна мапа (кілька goroutine можуть писати одночасно).
+	// running — які задачі зараз виконуються (або видаляються) в цьому процесі:
+	// ключ задачі → *runState. sync.Map — потокобезпечна мапа
+	// (кілька goroutine можуть писати одночасно).
 	running sync.Map
+}
+
+// runState — задача, яку зараз обробляє цей процес.
+type runState struct {
+	stop context.CancelCauseFunc // зупиняє Run; nil, якщо задачу видаляють
+}
+
+// ErrStopped — причина скасування контексту, коли задачу зупинили з адмін-панелі.
+var ErrStopped = errors.New("задачу зупинено")
+
+// IsRunning каже, чи задачу зараз виконує (або видаляє) цей процес.
+func (p *Pipeline) IsRunning(key string) bool {
+	_, ok := p.running.Load(key)
+	return ok
+}
+
+// Stop зупиняє виконання задачі. Повертається одразу: агент отримує Ctrl+C
+// і за кілька секунд завершується, після чого Run виходить, не змінюючи статус.
+func (p *Pipeline) Stop(key string) error {
+	v, ok := p.running.Load(key)
+	if !ok {
+		return fmt.Errorf("задача %s зараз не виконується", key)
+	}
+	st := v.(*runState)
+	if st.stop == nil {
+		return fmt.Errorf("%w: задачу %s саме видаляють", ErrRunning, key)
+	}
+	st.stop(ErrStopped)
+	slog.Info("зупиняю задачу", "key", key)
+	return nil
 }
 
 // Start створює нову задачу в базі: парсить посилання, читає Jira,
@@ -152,6 +198,9 @@ func (p *Pipeline) Start(ctx context.Context, jiraInput, repoName string) (*stor
 // Resume готує задачу до продовження. Якщо вона впала (FAILED) —
 // починаємо знову з розробки, передавши Developer'у причину падіння.
 func (p *Pipeline) Resume(ctx context.Context, key string) (*storage.Task, error) {
+	if p.IsRunning(key) {
+		return nil, fmt.Errorf("%w: задача %s ще не зупинилась", ErrRunning, key)
+	}
 	task, err := p.Store.GetTask(ctx, key)
 	if err != nil {
 		return nil, err
@@ -159,6 +208,9 @@ func (p *Pipeline) Resume(ctx context.Context, key string) (*storage.Task, error
 	switch task.Status {
 	case storage.StatusCompleted:
 		return nil, fmt.Errorf("задача %s вже виконана", key)
+	case storage.StatusPlanReview:
+		return nil, fmt.Errorf("%w: план задачі %s чекає на твоє рішення — схвали його або надішли правки",
+			ErrWrongState, key)
 	case storage.StatusFailed:
 		// Дописуємо причину падіння до фідбеку (там може вже бути звіт QA).
 		if task.LastError != "" {
@@ -168,6 +220,7 @@ func (p *Pipeline) Resume(ctx context.Context, key string) (*storage.Task, error
 		task.Status = storage.StatusCreated // заново створимо worktree (на тій самій гілці)
 		task.ReviewAttempts = 0
 		task.LastError = ""
+		task.AgentRole, task.AgentSession = "", "" // етап починаємо з нуля
 		if err := p.Store.SaveTask(ctx, task); err != nil {
 			return nil, err
 		}
@@ -175,11 +228,143 @@ func (p *Pipeline) Resume(ctx context.Context, key string) (*storage.Task, error
 	return task, nil
 }
 
+// ErrMerged — задачу не можна видалити: її коміти вже в main.
+var ErrMerged = errors.New("задача вже в main")
+
+// ErrRunning — задачу не можна видалити: її зараз виконують агенти.
+var ErrRunning = errors.New("задача зараз виконується")
+
+// ErrWrongState — дія не підходить до поточного статусу задачі
+// (наприклад, схвалити план, який ще не готовий).
+var ErrWrongState = errors.New("недоступно в поточному стані задачі")
+
+// ApprovePlan — людина схвалила план: задача йде на розробку.
+// Саму розробку запускає Run (його викликає API після цього методу).
+func (p *Pipeline) ApprovePlan(ctx context.Context, key string) (*storage.Task, error) {
+	return p.decidePlan(ctx, key, func(task *storage.Task) (string, string) {
+		now := time.Now()
+		task.PlanApprovedAt = &now
+		task.PlanFeedback = ""
+		task.Status = storage.StatusInDev
+		return verdictPlanOK, fmt.Sprintf("План (версія %d) схвалено — задача пішла на розробку.", task.PlanRevision)
+	})
+}
+
+// RevisePlan — людина написала правки до плану: Архітектор переробить його.
+func (p *Pipeline) RevisePlan(ctx context.Context, key, comment string) (*storage.Task, error) {
+	comment = strings.TrimSpace(comment)
+	if comment == "" {
+		return nil, errors.New("напиши, що саме треба змінити в плані")
+	}
+	return p.decidePlan(ctx, key, func(task *storage.Task) (string, string) {
+		task.PlanFeedback = comment
+		task.Status = storage.StatusInPlanning
+		return verdictPlanChanges, fmt.Sprintf("Правки до плану (версія %d) — Архітектор його переробить.", task.PlanRevision)
+	})
+}
+
+// decidePlan застосовує рішення людини до задачі, що чекає в PLAN_REVIEW,
+// зберігає її і записує рішення в історію. decide змінює задачу і повертає
+// вердикт та текст для хронології.
+func (p *Pipeline) decidePlan(ctx context.Context, key string, decide func(*storage.Task) (verdict, summary string)) (*storage.Task, error) {
+	// Займаємо задачу на час рішення — щоб два одночасні кліки
+	// («Схвалити» і «Надіслати правки») не перезаписали одне одного.
+	if _, busy := p.running.LoadOrStore(key, &runState{}); busy {
+		return nil, fmt.Errorf("%w: задача %s саме обробляється", ErrRunning, key)
+	}
+	defer p.running.Delete(key)
+
+	task, err := p.Store.GetTask(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != storage.StatusPlanReview {
+		return nil, fmt.Errorf("%w: задача %s не чекає на рішення щодо плану (статус %s)", ErrWrongState, key, task.Status)
+	}
+
+	verdict, summary := decide(task)
+	if err := p.Store.SaveTask(ctx, task); err != nil {
+		return nil, err
+	}
+	l := &storage.TaskLog{
+		TaskID:    task.ID,
+		StepName:  stepPlanReview,
+		AgentRole: "operator",
+		Verdict:   verdict,
+		Summary:   summary,
+	}
+	if verdict == verdictPlanChanges {
+		l.Feedback = task.PlanFeedback
+	}
+	if err := p.Store.AddLog(ctx, l); err != nil {
+		slog.Error("не вдалося записати рішення щодо плану", "key", key, "error", err)
+	}
+	slog.Info("рішення щодо плану", "key", key, "verdict", verdict, "revision", task.PlanRevision)
+	return task, nil
+}
+
+// Delete повністю видаляє задачу: worktree і гілку в кожному репозиторії
+// (разом з комітами), журнал дій агентів і всі записи в базі.
+//
+// Якщо хоч в одному репозиторії коміти задачі вже потрапили в main —
+// нічого не видаляємо і повертаємо ErrMerged: історію виконаної роботи
+// прибирати не можна.
+func (p *Pipeline) Delete(ctx context.Context, key string) error {
+	// Займаємо задачу, як Run: поки видаляємо, її не можна запустити.
+	if _, busy := p.running.LoadOrStore(key, &runState{}); busy {
+		return fmt.Errorf("%w: зупини задачу %s, щоб її видалити", ErrRunning, key)
+	}
+	defer p.running.Delete(key)
+
+	task, err := p.Store.GetTask(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	// Спершу перевіряємо всі репозиторії, і лише потім видаляємо —
+	// щоб не лишити задачу видаленою наполовину.
+	var merged []string
+	for _, r := range task.Repos {
+		into, err := p.Workspace.MergedInto(ctx, r.RepoName, r.BaseCommit, r.HeadCommit)
+		if err != nil {
+			return fmt.Errorf("перевірка мерджу в %s: %w", r.RepoName, err)
+		}
+		if into != "" {
+			merged = append(merged, fmt.Sprintf("%s (%s)", r.RepoName, into))
+		}
+	}
+	if len(merged) > 0 {
+		return fmt.Errorf("%w: неможливо видалити %s — гілку %s замерджено в %s",
+			ErrMerged, key, task.BranchName, strings.Join(merged, ", "))
+	}
+
+	for _, r := range task.Repos {
+		if err := p.Workspace.Purge(ctx, r.RepoName, r.WorktreePath, task.BranchName); err != nil {
+			return fmt.Errorf("видалення гілки в %s: %w", r.RepoName, err)
+		}
+	}
+	// Папка задачі (/tmp/workspaces/<KEY>) і журнал дій агентів.
+	_ = os.RemoveAll(filepath.Join(p.Workspace.WorktreesDir, key))
+	if p.Runner != nil && p.Runner.LogDir != "" {
+		_ = os.Remove(filepath.Join(p.Runner.LogDir, key+".log"))
+	}
+
+	if err := p.Store.DeleteTask(ctx, key); err != nil {
+		return err
+	}
+	slog.Info("задачу видалено", "key", key)
+	return nil
+}
+
 // Run виконує задачу від поточного статусу до фінального (COMPLETED/FAILED).
 // Це і є головний цикл скінченного автомата.
 func (p *Pipeline) Run(ctx context.Context, key string) error {
+	// WithCancelCause — контекст, який Stop скасує з причиною ErrStopped.
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+
 	// Захист від подвійного запуску однієї задачі в одному процесі.
-	if _, alreadyRunning := p.running.LoadOrStore(key, true); alreadyRunning {
+	if _, alreadyRunning := p.running.LoadOrStore(key, &runState{stop: stop}); alreadyRunning {
 		return fmt.Errorf("задача %s вже виконується", key)
 	}
 	defer p.running.Delete(key)
@@ -189,13 +374,16 @@ func (p *Pipeline) Run(ctx context.Context, key string) error {
 		return err
 	}
 
-	for !task.Status.IsFinal() {
+	// IsWaiting: план чекає на людину — виходимо, продовжить ApprovePlan / RevisePlan.
+	for !task.Status.IsFinal() && !task.Status.IsWaiting() {
 		slog.Info("етап", "key", key, "status", task.Status, "review_attempts", task.ReviewAttempts)
 
 		var stepErr error
 		switch task.Status {
 		case storage.StatusCreated:
 			stepErr = p.prepare(ctx, task)
+		case storage.StatusInPlanning:
+			stepErr = p.plan(ctx, task)
 		case storage.StatusInDev:
 			stepErr = p.develop(ctx, task)
 		case storage.StatusInReview:
@@ -210,8 +398,9 @@ func (p *Pipeline) Run(ctx context.Context, key string) error {
 			// Якщо нас зупинили (Ctrl+C / зупинка контейнера) — НЕ позначаємо
 			// задачу як FAILED: статус лишається, і її можна продовжити через resume.
 			if ctx.Err() != nil {
-				slog.Warn("виконання перервано, задачу можна продовжити", "key", key, "status", task.Status)
-				return ctx.Err()
+				slog.Warn("виконання перервано, задачу можна продовжити", "key", key,
+					"status", task.Status, "cause", context.Cause(ctx), "session", task.AgentSession)
+				return context.Cause(ctx)
 			}
 			return p.fail(ctx, task, stepErr)
 		}
@@ -221,14 +410,19 @@ func (p *Pipeline) Run(ctx context.Context, key string) error {
 		}
 	}
 
+	if task.Status.IsWaiting() {
+		slog.Info("план готовий і чекає на рішення в адмін-панелі", "key", key, "revision", task.PlanRevision)
+		return nil
+	}
 	slog.Info("задачу завершено", "key", key, "status", task.Status)
 	return nil
 }
 
 // ───────────────────────────── Етапи ─────────────────────────────
 
-// prepare: CREATED → IN_DEV. Створюємо ізольований git worktree
-// для кожного репозиторію задачі.
+// prepare: CREATED → IN_PLANNING (або одразу IN_DEV, якщо план уже схвалено —
+// наприклад, задачу перезапустили після падіння). Створюємо ізольований
+// git worktree для кожного репозиторію задачі.
 func (p *Pipeline) prepare(ctx context.Context, task *storage.Task) error {
 	// range по індексу: r — вказівник на елемент слайсу, тож зміни
 	// потраплять у сам task.Repos (а не в його копію).
@@ -252,17 +446,56 @@ func (p *Pipeline) prepare(ctx context.Context, task *storage.Task) error {
 	}
 	task.WorktreePath = main.WorktreePath
 	task.BaseCommit = main.BaseCommit
-	task.Status = storage.StatusInDev
+	task.Status = storage.StatusInPlanning
+	if task.PlanApprovedAt != nil {
+		task.Status = storage.StatusInDev
+	}
+	return nil
+}
+
+// plan: IN_PLANNING → PLAN_REVIEW. Architect досліджує код і пише план;
+// далі задача чекає, поки людина його схвалить або напише правки.
+func (p *Pipeline) plan(ctx context.Context, task *storage.Task) error {
+	run, err := p.runAgent(ctx, task, "architect", architectPrompt(task))
+	res := run.Result
+	if err != nil {
+		p.addLog(ctx, task, stepPlanning, "architect", 0, run, err, "", "")
+		return err
+	}
+
+	// Архітектор має лише читати код. Якщо він усе ж щось змінив — скасовуємо,
+	// щоб ці зміни не потрапили в коміт розробника. Планування буває лише до
+	// схвалення плану, тобто ще до будь-якої роботи розробника.
+	for _, r := range task.Repos {
+		discarded, err := p.Workspace.DiscardChanges(ctx, r.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("скасування змін архітектора в %s: %w", r.RepoName, err)
+		}
+		if discarded {
+			slog.Warn("архітектор змінив файли — зміни скасовано", "key", task.ID, "repo", r.RepoName)
+		}
+	}
+
+	plan := extractPlan(res.Text)
+	if plan == "" {
+		err := errors.New("архітектор не повернув план")
+		p.addLog(ctx, task, stepPlanning, "architect", 0, run, err, "", "")
+		return err
+	}
+	task.Plan = plan
+	task.PlanRevision++
+	task.PlanFeedback = ""
+	p.addLog(ctx, task, stepPlanning, "architect", 0, run, nil, verdictPlanReady, "")
+	task.Status = storage.StatusPlanReview
 	return nil
 }
 
 // develop: IN_DEV → IN_REVIEW. Developer пише код, ми комітимо результат.
 func (p *Pipeline) develop(ctx context.Context, task *storage.Task) error {
 	iteration := task.ReviewAttempts + 1
-	prompt := developerPrompt(task)
-	res, err := p.runAgent(ctx, task, "developer", prompt)
+	run, err := p.runAgent(ctx, task, "developer", developerPrompt(task))
 	if err != nil {
-		p.addLog(ctx, task, stepDevelopment, "developer", iteration, prompt, res, err, "", "")
+		p.addLog(ctx, task, stepDevelopment, "developer", iteration, run, err, "", "")
 		return err
 	}
 
@@ -277,7 +510,7 @@ func (p *Pipeline) develop(ctx context.Context, task *storage.Task) error {
 		return err
 	}
 
-	p.addLog(ctx, task, stepDevelopment, "developer", iteration, prompt, res, nil, verdictDone, "")
+	p.addLog(ctx, task, stepDevelopment, "developer", iteration, run, nil, verdictDone, "")
 	task.Status = storage.StatusInReview
 	return nil
 }
@@ -289,29 +522,32 @@ func (p *Pipeline) review(ctx context.Context, task *storage.Task) error {
 	if err != nil {
 		return err
 	}
-	prompt := reviewerPrompt(task, changed)
-	res, err := p.runAgent(ctx, task, "reviewer", prompt)
+	run, err := p.runAgent(ctx, task, "reviewer", reviewerPrompt(task, changed))
+	res := run.Result
 
 	// Читаємо review_feedback.md (якщо рев'юер його створив) і одразу
-	// видаляємо, щоб файл не потрапив у коміт.
+	// видаляємо, щоб файл не потрапив у коміт. Якщо рев'юера зупинили —
+	// файл лишаємо: відновлена сесія допише його.
 	feedbackPath := filepath.Join(task.WorktreePath, reviewFeedbackFile)
 	feedbackBytes, _ := os.ReadFile(feedbackPath) // помилку ігноруємо: файлу може й не бути
-	_ = os.Remove(feedbackPath)
+	if ctx.Err() == nil {
+		_ = os.Remove(feedbackPath)
+	}
 	feedback := strings.TrimSpace(string(feedbackBytes))
 
 	if err != nil {
-		p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, err, "", feedback)
+		p.addLog(ctx, task, stepReview, "reviewer", iteration, run, err, "", feedback)
 		return err
 	}
 
 	if isApproved(res.Text) {
 		slog.Info("рев'ю пройдено ✅", "key", task.ID)
-		p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, nil, verdictApprove, feedback)
+		p.addLog(ctx, task, stepReview, "reviewer", iteration, run, nil, verdictApprove, feedback)
 		task.LastFeedback = ""
 		task.Status = storage.StatusInTest
 		return nil
 	}
-	p.addLog(ctx, task, stepReview, "reviewer", iteration, prompt, res, nil, verdictChanges, feedback)
+	p.addLog(ctx, task, stepReview, "reviewer", iteration, run, nil, verdictChanges, feedback)
 
 	// Зауваження: беремо з файлу, а якщо файлу немає — з відповіді агента.
 	task.LastFeedback = feedback
@@ -340,10 +576,10 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	if err != nil {
 		return err
 	}
-	prompt := testerPrompt(task, changed)
-	res, err := p.runAgent(ctx, task, "tester", prompt)
+	run, err := p.runAgent(ctx, task, "tester", testerPrompt(task, changed))
+	res := run.Result
 	if err != nil {
-		p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, err, "", "")
+		p.addLog(ctx, task, stepTesting, "tester", iteration, run, err, "", "")
 		return err
 	}
 
@@ -357,13 +593,13 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	task.TestReport = res.Text
 
 	if !isTestPassed(res.Text) {
-		p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, nil, testFailed, "")
+		p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testFailed, "")
 		// Звіт тестувальника стане фідбеком для Developer'а при resume.
 		task.LastFeedback = "Звіт QA:\n" + res.Text
 		return errors.New("тестування не пройдено, подробиці — у звіті QA")
 	}
 
-	p.addLog(ctx, task, stepTesting, "tester", iteration, prompt, res, nil, testPassed, "")
+	p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testPassed, "")
 	p.cleanup(ctx, task)
 	now := time.Now()
 	task.CompletedAt = &now
@@ -373,8 +609,103 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 
 // ───────────────────────────── Допоміжне ─────────────────────────────
 
-// runAgent запускає claude з налаштуваннями ролі.
-func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, prompt string) (*agent.Result, error) {
+// AgentRoles — ролі агентів, які працюють над задачею (для налаштувань в адмін-панелі).
+var AgentRoles = []string{"architect", "developer", "reviewer", "tester"}
+
+// agentRun — один запуск агента: результат, завдання, яке він отримав насправді,
+// і як він працював із сесією (storage.SessionNew / SessionResume / SessionContinue).
+type agentRun struct {
+	Result      *agent.Result
+	Prompt      string
+	SessionMode string
+}
+
+// runAgent запускає claude з налаштуваннями ролі. Сесію обирає так:
+//
+//  1. Етап уже починав агент цієї ролі, а потім задачу зупинили — відновлюємо
+//     ту саму сесію з коротким «продовжуй» (continue).
+//  2. Роль уже працювала над задачею раніше (наприклад, розробник після рев'ю),
+//     і для ролі в налаштуваннях увімкнено «продовжувати сесію» — продовжуємо
+//     її сесію (claude --resume) з новим завданням (resume).
+//  3. Інакше — нова сесія (new).
+//
+// Id сесії записуємо в БД ще до старту агента: якщо процес впаде посеред роботи,
+// сесію все одно можна буде відновити.
+func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, prompt string) (*agentRun, error) {
+	if task.AgentRole == role && task.AgentSession != "" {
+		if run, ok, err := p.tryResume(ctx, task, role, resumePrompt, task.AgentSession, storage.SessionContinue); ok {
+			return run, err
+		}
+	}
+
+	if p.resumeEnabled(ctx, role) {
+		session, err := p.Store.RoleSession(ctx, task.ID, role)
+		if err != nil {
+			return &agentRun{Prompt: prompt}, fmt.Errorf("читання сесії ролі %s: %w", role, err)
+		}
+		if session != "" {
+			if err := p.rememberSession(ctx, task, role, session); err != nil {
+				return &agentRun{Prompt: prompt}, err
+			}
+			if run, ok, err := p.tryResume(ctx, task, role, returnPrompt+prompt, session, storage.SessionResume); ok {
+				return run, err
+			}
+		}
+	}
+
+	session := newSessionID()
+	if err := p.rememberSession(ctx, task, role, session); err != nil {
+		return &agentRun{Prompt: prompt}, err
+	}
+	if err := p.Store.SetRoleSession(ctx, task.ID, role, session); err != nil {
+		return &agentRun{Prompt: prompt}, fmt.Errorf("збереження сесії ролі %s: %w", role, err)
+	}
+	res, err := p.launchAgent(ctx, task, role, prompt, session, false)
+	if err == nil {
+		task.AgentRole, task.AgentSession = "", ""
+	}
+	return &agentRun{Result: res, Prompt: prompt, SessionMode: storage.SessionNew}, err
+}
+
+// tryResume продовжує наявну сесію. ok = false — сесію не вдалося відкрити
+// (наприклад, її файл видалили) і агент не зробив жодного кроку: тоді
+// runAgent почне етап у новій сесії.
+func (p *Pipeline) tryResume(ctx context.Context, task *storage.Task, role, prompt, session, mode string) (*agentRun, bool, error) {
+	res, err := p.launchAgent(ctx, task, role, prompt, session, true)
+	if err == nil || ctx.Err() != nil || (res != nil && res.NumTurns > 0) {
+		if err == nil {
+			task.AgentRole, task.AgentSession = "", ""
+		}
+		return &agentRun{Result: res, Prompt: prompt, SessionMode: mode}, true, err
+	}
+	slog.Warn("не вдалося відновити сесію агента, починаю етап у новій сесії",
+		"key", task.ID, "role", role, "session", session, "mode", mode, "error", err)
+	return nil, false, nil
+}
+
+// rememberSession записує, яка сесія виконує поточний етап, — щоб після
+// зупинки задачі «Продовжити» відновило саме її.
+func (p *Pipeline) rememberSession(ctx context.Context, task *storage.Task, role, session string) error {
+	task.AgentRole, task.AgentSession = role, session
+	if err := p.Store.SetAgentSession(ctx, task.ID, role, session); err != nil {
+		return fmt.Errorf("збереження сесії агента: %w", err)
+	}
+	return nil
+}
+
+// resumeEnabled каже, чи для ролі ввімкнено «продовжувати сесію».
+// Якщо налаштування не вдалося прочитати — діє значення за замовчуванням (так).
+func (p *Pipeline) resumeEnabled(ctx context.Context, role string) bool {
+	settings, err := p.Store.RoleSettings(ctx, []string{role})
+	if err != nil {
+		slog.Warn("не вдалося прочитати налаштування ролі, продовжую сесію", "role", role, "error", err)
+		return true
+	}
+	return settings[0].ResumeSession
+}
+
+// launchAgent запускає claude з налаштуваннями ролі.
+func (p *Pipeline) launchAgent(ctx context.Context, task *storage.Task, role, prompt, session string, resume bool) (*agent.Result, error) {
 	roleCfg := p.Roles[role]
 
 	// claude запускається в основному репозиторії, а worktree інших
@@ -395,14 +726,25 @@ func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, promp
 		SystemInstruction: roleCfg.SystemInstruction,
 		Model:             roleCfg.Model,
 		ExtraFlags:        flags,
+		SessionID:         session,
+		Resume:            resume,
 	})
+}
+
+// newSessionID генерує випадковий UUID v4 — у такому форматі claude приймає --session-id.
+func newSessionID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = b[6]&0x0f | 0x40 // версія 4
+	b[8] = b[8]&0x3f | 0x80 // варіант RFC 4122
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // addLog записує запуск агента в історію задачі (таблиця task_logs).
 // Якщо агент завершився помилкою (runErr != nil), вердикт — ERROR,
 // а якщо його зупинили (Ctrl+C / зупинка контейнера) — INTERRUPTED.
 func (p *Pipeline) addLog(ctx context.Context, task *storage.Task, step, role string, iteration int,
-	prompt string, res *agent.Result, runErr error, verdict, feedback string) {
+	run *agentRun, runErr error, verdict, feedback string) {
 	if runErr != nil {
 		verdict = verdictError
 		if ctx.Err() != nil {
@@ -411,16 +753,18 @@ func (p *Pipeline) addLog(ctx context.Context, task *storage.Task, step, role st
 	}
 
 	l := &storage.TaskLog{
-		TaskID:    task.ID,
-		StepName:  step,
-		AgentRole: role,
-		Iteration: iteration,
-		Verdict:   verdict,
-		Prompt:    prompt,
-		Feedback:  feedback,
+		TaskID:      task.ID,
+		StepName:    step,
+		AgentRole:   role,
+		Iteration:   iteration,
+		Verdict:     verdict,
+		Prompt:      run.Prompt,
+		Feedback:    feedback,
+		SessionMode: run.SessionMode,
 	}
-	if res != nil {
+	if res := run.Result; res != nil {
 		l.Summary = res.Text
+		l.Brief = extractBrief(res.Text)
 		l.CostUSD = res.CostUSD
 		l.NumTurns = res.NumTurns
 		l.DurationMS = res.Duration.Milliseconds()
@@ -458,6 +802,7 @@ func (p *Pipeline) fail(ctx context.Context, task *storage.Task, cause error) er
 
 	task.Status = storage.StatusFailed
 	task.LastError = cause.Error()
+	task.AgentRole, task.AgentSession = "", ""
 	if err := p.Store.SaveTask(ctx, task); err != nil {
 		return err
 	}

@@ -8,8 +8,14 @@
 //	GET  /api/tasks/{id}           — стан задачі
 //	GET  /api/tasks/{id}/logs      — історія запусків агентів (вердикти, фідбек, вартість)
 //	GET  /api/tasks/{id}/activity  — живий журнал дій агентів (останні рядки)
-//	POST /api/tasks/{id}/resume    — продовжити перервану / впавшу задачу
+//	POST /api/tasks/{id}/resume    — продовжити зупинену / перервану / впавшу задачу
+//	POST /api/tasks/{id}/stop      — зупинити виконання (сесію агента можна відновити)
+//	POST /api/tasks/{id}/plan/approve — схвалити план Архітектора і почати розробку
+//	POST /api/tasks/{id}/plan/revise  — надіслати правки до плану {"comment": "..."}
+//	DELETE /api/tasks/{id}         — видалити задачу з гілками (якщо ще не в main)
 //	GET  /api/info                 — основний репозиторій і список репозиторіїв
+//	GET  /api/settings             — налаштування ролей (продовжувати сесію чи починати заново)
+//	PUT  /api/settings             — зберегти налаштування ролей {"roles": [{"role": "...", "resume_session": true}]}
 //
 // Використовуємо лише стандартну бібліотеку net/http: починаючи з Go 1.22
 // роутер вміє метод і параметри в шляху ("GET /api/tasks/{id}"),
@@ -20,11 +26,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -61,7 +69,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/logs", s.getLogs)
 	mux.HandleFunc("GET /api/tasks/{id}/activity", s.getActivity)
 	mux.HandleFunc("POST /api/tasks/{id}/resume", s.resumeTask)
+	mux.HandleFunc("POST /api/tasks/{id}/stop", s.stopTask)
+	mux.HandleFunc("POST /api/tasks/{id}/plan/approve", s.approvePlan)
+	mux.HandleFunc("POST /api/tasks/{id}/plan/revise", s.revisePlan)
+	mux.HandleFunc("DELETE /api/tasks/{id}", s.deleteTask)
 	mux.HandleFunc("GET /api/info", s.getInfo)
+	mux.HandleFunc("GET /api/settings", s.getSettings)
+	mux.HandleFunc("PUT /api/settings", s.saveSettings)
 	return mux
 }
 
@@ -87,6 +101,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.runInBackground(task.ID)
+	task.Running = true
 	// 202 Accepted — "прийнято, виконується у фоні".
 	writeJSON(w, http.StatusAccepted, task)
 }
@@ -98,7 +113,54 @@ func (s *Server) resumeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.runInBackground(task.ID)
+	task.Running = true
 	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
+	if err := s.pipeline.Stop(r.PathValue("id")); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	// 202: зупинка асинхронна — агенту потрібно кілька секунд, щоб завершитись.
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
+}
+
+func (s *Server) approvePlan(w http.ResponseWriter, r *http.Request) {
+	task, err := s.pipeline.ApprovePlan(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	s.runInBackground(task.ID)
+	task.Running = true
+	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (s *Server) revisePlan(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New(`очікую JSON {"comment": "..."}`))
+		return
+	}
+	task, err := s.pipeline.RevisePlan(r.Context(), r.PathValue("id"), req.Comment)
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	s.runInBackground(task.ID)
+	task.Running = true
+	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (s *Server) deleteTask(w http.ResponseWriter, r *http.Request) {
+	if err := s.pipeline.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +168,9 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	for _, t := range tasks {
+		t.Running = s.pipeline.IsRunning(t.ID)
 	}
 	writeJSON(w, http.StatusOK, tasks)
 }
@@ -117,6 +182,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	task.Running = s.pipeline.IsRunning(task.ID)
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -171,6 +237,38 @@ func (s *Server) getInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type settingsBody struct {
+	Roles []storage.RoleSetting `json:"roles"`
+}
+
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
+	roles, err := s.store.RoleSettings(r.Context(), pipeline.AgentRoles)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settingsBody{Roles: roles})
+}
+
+func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
+	var req settingsBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New(`очікую JSON {"roles": [{"role": "...", "resume_session": true}]}`))
+		return
+	}
+	for _, st := range req.Roles {
+		if !slices.Contains(pipeline.AgentRoles, st.Role) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("невідома роль %q", st.Role))
+			return
+		}
+	}
+	if err := s.store.SaveRoleSettings(r.Context(), req.Roles); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.getSettings(w, r)
+}
+
 // runInBackground запускає задачу в окремій goroutine ("легкому потоці").
 // HTTP-відповідь повертається одразу, а задача працює далі.
 func (s *Server) runInBackground(taskID string) {
@@ -196,6 +294,11 @@ func writeError(w http.ResponseWriter, status int, err error) {
 func statusFor(err error) int {
 	if errors.Is(err, storage.ErrNotFound) {
 		return http.StatusNotFound
+	}
+	// 409 Conflict — запит правильний, але стан задачі його не дозволяє.
+	if errors.Is(err, pipeline.ErrMerged) || errors.Is(err, pipeline.ErrRunning) ||
+		errors.Is(err, pipeline.ErrWrongState) {
+		return http.StatusConflict
 	}
 	return http.StatusBadRequest
 }

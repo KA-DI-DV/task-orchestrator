@@ -34,7 +34,7 @@ export function PipelineSteps({ status, logs }: { status: Status; logs: TaskLog[
   )
 }
 
-// Маленький індикатор у списку задач: 4 риски (розробка, рев'ю, тест, готово).
+// Маленький індикатор у списку задач: риска на кожен етап після «Створено».
 // Для FAILED усі риски червоні: де саме впала, видно на сторінці задачі.
 export function PipelineDots({ status }: { status: Status }) {
   const steps = PIPELINE.slice(1)

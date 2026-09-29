@@ -23,7 +23,7 @@ type Config struct {
 	Server       ServerConfig          `yaml:"server"`
 	Database     DatabaseConfig        `yaml:"database"`
 	Orchestrator OrchestratorConfig    `yaml:"orchestrator"`
-	Roles        map[string]RoleConfig `yaml:"roles"` // ключ: developer / reviewer / tester / jira
+	Roles        map[string]RoleConfig `yaml:"roles"` // ключ: architect / developer / reviewer / tester / jira
 }
 
 type ServerConfig struct {
@@ -122,7 +122,7 @@ func applyEnv(cfg *Config) {
 }
 
 func (c *Config) validate() error {
-	for _, role := range []string{"developer", "reviewer", "tester", "jira"} {
+	for _, role := range []string{"architect", "developer", "reviewer", "tester", "jira"} {
 		if _, ok := c.Roles[role]; !ok {
 			return fmt.Errorf("у config.yaml не описана роль %q", role)
 		}

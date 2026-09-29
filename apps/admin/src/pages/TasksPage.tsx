@@ -3,18 +3,19 @@ import { Link } from 'react-router'
 import {
   CircleCheck, CircleX, Coins, Eye, FolderGit2, GitBranch, Hourglass, Inbox, Plus, Search, Sparkles,
 } from 'lucide-react'
-import { api, isFinal, type Task } from '../api'
+import { api, isFinal, isStopped, isWaiting, type Task } from '../api'
 import { usePolling } from '../hooks'
-import { money, plural, timeAgo } from '../format'
+import { COST_HINT, money, plural, timeAgo } from '../format'
 import { StatusBadge } from '../components/Badges'
 import { PipelineDots } from '../components/Pipeline'
 import { NewTaskDialog } from '../components/NewTaskDialog'
 
-type Filter = 'all' | 'active' | 'done' | 'failed'
+type Filter = 'all' | 'waiting' | 'active' | 'done' | 'failed'
 
 const FILTERS: { key: Filter; label: string; match: (t: Task) => boolean }[] = [
   { key: 'all', label: 'Усі', match: () => true },
-  { key: 'active', label: 'В роботі', match: (t) => !isFinal(t.status) },
+  { key: 'waiting', label: 'Чекають на тебе', match: (t) => isWaiting(t.status) },
+  { key: 'active', label: 'В роботі', match: (t) => !isFinal(t.status) && !isWaiting(t.status) },
   { key: 'done', label: 'Готові', match: (t) => t.status === 'COMPLETED' },
   { key: 'failed', label: 'Впали', match: (t) => t.status === 'FAILED' },
 ]
@@ -34,7 +35,8 @@ export function TasksPage() {
   const [creating, setCreating] = useState(false)
 
   const list = tasks ?? []
-  const active = list.filter((t) => !isFinal(t.status)).length
+  const active = list.filter((t) => !isFinal(t.status) && !isWaiting(t.status)).length
+  const waiting = list.filter((t) => isWaiting(t.status)).length
   const done = list.filter((t) => t.status === 'COMPLETED').length
   const failed = list.filter((t) => t.status === 'FAILED').length
   const cost = list.reduce((sum, t) => sum + t.total_cost_usd, 0)
@@ -54,6 +56,7 @@ export function TasksPage() {
             {active > 0
               ? `Агенти зараз працюють над ${active} ${plural(active, 'задачею', 'задачами', 'задачами')}.`
               : 'Зараз агенти відпочивають — саме час дати їм нову задачу.'}
+            {waiting > 0 && ` ${waiting} ${plural(waiting, 'план чекає', 'плани чекають', 'планів чекають')} на твоє рішення.`}
           </p>
         </div>
         <button className="btn btn-primary" onClick={() => setCreating(true)}>
@@ -65,7 +68,7 @@ export function TasksPage() {
         <Stat tone="blue" icon={<Hourglass size={20} />} value={active} label="В роботі" />
         <Stat tone="green" icon={<CircleCheck size={20} />} value={done} label="Готові" />
         <Stat tone="red" icon={<CircleX size={20} />} value={failed} label="Впали" />
-        <Stat tone="accent" icon={<Coins size={20} />} value={money(cost)} label="Витрачено на агентів" />
+        <Stat tone="accent" icon={<Coins size={20} />} value={money(cost)} label="Умовна вартість (за цінами API)" title={COST_HINT} />
       </div>
 
       <div className="toolbar">
@@ -116,9 +119,9 @@ export function TasksPage() {
   )
 }
 
-function Stat({ tone, icon, value, label }: { tone: string; icon: React.ReactNode; value: React.ReactNode; label: string }) {
+function Stat({ tone, icon, value, label, title }: { tone: string; icon: React.ReactNode; value: React.ReactNode; label: string; title?: string }) {
   return (
-    <div className="card stat">
+    <div className="card stat" title={title}>
       <div className={`stat-icon tone-${tone}`}>{icon}</div>
       <div>
         <div className="stat-value">{value}</div>
@@ -145,13 +148,13 @@ function TaskRow({ task: t }: { task: Task }) {
               : 'змін ще немає'}
           </span>
           <span><Eye size={14} /> рев'ю {t.review_attempts}/{t.max_review_attempts}</span>
-          <span><Coins size={14} /> {money(t.total_cost_usd)}</span>
+          <span title={COST_HINT}><Coins size={14} /> {money(t.total_cost_usd)}</span>
           <span>оновлено {timeAgo(t.updated_at)}</span>
         </div>
       </div>
       <div className="task-side">
         <PipelineDots status={t.status} />
-        <StatusBadge status={t.status} />
+        <StatusBadge status={t.status} stopped={isStopped(t)} />
       </div>
     </Link>
   )

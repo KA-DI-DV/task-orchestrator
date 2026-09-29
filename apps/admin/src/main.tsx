@@ -8,6 +8,7 @@ import './styles.css'
 import { Layout } from './components/Layout'
 import { TasksPage } from './pages/TasksPage'
 import { TaskPage } from './pages/TaskPage'
+import { SettingsPage } from './pages/SettingsPage'
 
 function NotFound() {
   return (
@@ -29,6 +30,7 @@ createRoot(document.getElementById('root')!).render(
         <Routes>
           <Route path="/" element={<TasksPage />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </Layout>

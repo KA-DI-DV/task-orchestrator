@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { NavLink } from 'react-router'
-import { LayoutList, Leaf, Moon, Sun } from 'lucide-react'
+import { LayoutList, Leaf, Moon, Settings, Sun } from 'lucide-react'
 
 type Theme = 'light' | 'dark'
 
@@ -33,12 +33,13 @@ export function Layout({ children }: { children: ReactNode }) {
           <div className="brand-mark"><Leaf size={20} /></div>
           <div>
             <div className="brand-name">Orchestrator</div>
-            <div className="brand-sub">Developer → Reviewer → QA</div>
+            <div className="brand-sub">Architect → Developer → Reviewer → QA</div>
           </div>
         </div>
 
         <nav className="nav">
           <NavLink to="/" end><LayoutList size={18} /> Задачі</NavLink>
+          <NavLink to="/settings"><Settings size={18} /> Налаштування</NavLink>
         </nav>
 
         <div className="sidebar-foot">

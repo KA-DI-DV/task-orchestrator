@@ -1,27 +1,30 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import {
-  Activity, ArrowLeft, Check, ChevronRight, Clock, Coins, Copy, ExternalLink, FileText, FlaskConical,
-  Footprints, FolderGit2, GitBranch, GitCommitHorizontal, History, MessageSquareQuote, RefreshCw,
-  RotateCcw, Timer, TriangleAlert,
+  Activity, ArrowLeft, Check, ChevronRight, ClipboardCheck, Clock, Coins, Copy, DraftingCompass, ExternalLink,
+  FileText, FlaskConical, PencilLine, Send,
+  Footprints, FolderGit2, GitBranch, GitCommitHorizontal, History, ListChecks, MessageSquareQuote, RefreshCw,
+  CirclePause, Square, RotateCcw, Timer, Trash2, TriangleAlert,
 } from 'lucide-react'
-import { api, isFinal, type Task, type TaskLog, type TaskRepo } from '../api'
+import { api, isFinal, isStopped, isWaiting, type Task, type TaskLog, type TaskRepo } from '../api'
 import { usePolling } from '../hooks'
-import { dateTime, duration, money, plural, shortSha, timeAgo } from '../format'
+import { COST_HINT, dateTime, duration, money, plural, shortSha, timeAgo } from '../format'
 import { ROLE, VERDICT } from '../meta'
 import { RoleIcon, StatusBadge, VerdictBadge } from '../components/Badges'
 import { PipelineSteps } from '../components/Pipeline'
-import { Clamp } from '../components/Markdown'
+import { Clamp, Markdown } from '../components/Markdown'
 
-type Tab = 'overview' | 'timeline' | 'repos' | 'live'
+type Tab = 'plan' | 'overview' | 'timeline' | 'repos' | 'live'
 
 export function TaskPage() {
   const { id = '' } = useParams()
   const [params, setParams] = useSearchParams()
-  const tab = (params.get('tab') as Tab) || 'overview'
-  const setTab = (t: Tab) => setParams(t === 'overview' ? {} : { tab: t }, { replace: true })
-
   const task = usePolling(`task-${id}`, () => api.task(id), 4000)
+  // Поки йде планування або план чекає на рішення — за замовчуванням відкриваємо план.
+  const planning = task.data?.status === 'IN_PLANNING' || task.data?.status === 'PLAN_REVIEW'
+  const tab = (params.get('tab') as Tab) || (planning ? 'plan' : 'overview')
+  const setTab = (t: Tab) => setParams({ tab: t }, { replace: true })
+
   const running = task.data ? !isFinal(task.data.status) : true
   const logs = usePolling(`logs-${id}`, () => api.logs(id), 6000, running)
 
@@ -46,25 +49,43 @@ export function TaskPage() {
   const t = task.data
   const history = logs.data ?? []
   const changed = (t.repos ?? []).filter((r) => r.commits > 0)
+  const refresh = () => { void task.refresh(); void logs.refresh() }
+  const hasPlan = Boolean(t.plan) || planning
 
   return (
     <div className="page">
       <Link to="/" className="back"><ArrowLeft size={16} /> Усі задачі</Link>
 
-      <Header task={t} onResumed={() => { void task.refresh(); void logs.refresh() }} />
+      <Header task={t} onChanged={refresh} />
       <PipelineSteps status={t.status} logs={history} />
 
+      {isWaiting(t.status) && tab !== 'plan' && (
+        <div className="callout tone-accent">
+          <ClipboardCheck size={18} />
+          <div className="callout-body">
+            <div className="callout-title">План (версія {t.plan_revision}) чекає на твоє рішення</div>
+            Прочитай його і схвали — тоді задача піде на розробку, або напиши правки, і Архітектор його переробить.
+          </div>
+          <button className="btn btn-primary btn-sm" onClick={() => setTab('plan')}>Відкрити план</button>
+        </div>
+      )}
+
       <div className="tabs" role="tablist">
+        {hasPlan && (
+          <TabButton active={tab === 'plan'} onClick={() => setTab('plan')} icon={<DraftingCompass size={16} />}>План</TabButton>
+        )}
         <TabButton active={tab === 'overview'} onClick={() => setTab('overview')} icon={<FileText size={16} />}>Огляд</TabButton>
         <TabButton active={tab === 'timeline'} onClick={() => setTab('timeline')} icon={<History size={16} />} count={history.length}>Хронологія</TabButton>
         <TabButton active={tab === 'repos'} onClick={() => setTab('repos')} icon={<FolderGit2 size={16} />} count={changed.length}>Репозиторії</TabButton>
         <TabButton active={tab === 'live'} onClick={() => setTab('live')} icon={<Activity size={16} />}>Живий журнал</TabButton>
       </div>
 
+      {isStopped(t) && <StoppedNote task={t} />}
+      {tab === 'plan' && <PlanTab task={t} onChanged={refresh} />}
       {tab === 'overview' && <Overview task={t} logs={history} />}
       {tab === 'timeline' && <Timeline logs={history} loading={logs.data === null} />}
       {tab === 'repos' && <Repos repos={t.repos ?? []} branch={t.branch_name} />}
-      {tab === 'live' && <Live id={t.id} running={running} />}
+      {tab === 'live' && <Live id={t.id} running={running} stopped={isStopped(t)} waiting={isWaiting(t.status)} />}
     </div>
   )
 }
@@ -81,10 +102,13 @@ function TabButton({ active, onClick, icon, count, children }: {
 
 // ───────────────────────────── Шапка ─────────────────────────────
 
-function Header({ task: t, onResumed }: { task: Task; onResumed: () => void }) {
+function Header({ task: t, onChanged }: { task: Task; onChanged: () => void }) {
+  const navigate = useNavigate()
   const [copied, setCopied] = useState(false)
-  const [confirm, setConfirm] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   async function copyBranch() {
@@ -98,22 +122,52 @@ function Header({ task: t, onResumed }: { task: Task; onResumed: () => void }) {
   }
 
   async function resume() {
-    // Незавершену задачу продовжуємо лише після підтвердження: якщо її ще виконує
-    // інший процес (task run у терміналі), другий запуск їй зашкодить.
-    if (!isFinal(t.status) && !confirm) {
-      setConfirm(true)
-      return
-    }
+    // Підтвердження не потрібне: сервер сам відмовить (409), якщо задача ще виконується.
     setBusy(true)
     setError(null)
     try {
       await api.resume(t.id)
-      setConfirm(false)
-      onResumed()
+      onChanged()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function stop() {
+    // Агент отримує Ctrl+C і завершується за кілька секунд — кнопка крутиться,
+    // доки опитування не покаже running=false.
+    setStopping(true)
+    setError(null)
+    try {
+      await api.stop(t.id)
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setStopping(false)
+    }
+  }
+
+  // Зупинка завершилась — повертаємо кнопці звичайний вигляд.
+  useEffect(() => { if (!t.running) setStopping(false) }, [t.running])
+
+  async function remove() {
+    // Видалення незворотне (гілки з комітами теж зникають) — лише після підтвердження.
+    if (!confirmDelete) {
+      setConfirmDelete(true)
+      return
+    }
+    setDeleting(true)
+    setError(null)
+    try {
+      await api.remove(t.id)
+      navigate('/', { replace: true })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setConfirmDelete(false)
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -124,7 +178,7 @@ function Header({ task: t, onResumed }: { task: Task; onResumed: () => void }) {
       <div className="task-head-main">
         <div className="task-head-line">
           <span className="key">{t.id}</span>
-          <StatusBadge status={t.status} large />
+          <StatusBadge status={t.status} large stopped={isStopped(t)} />
           {jiraLink && (
             <a className="btn btn-ghost btn-sm" href={jiraLink} target="_blank" rel="noreferrer">
               <ExternalLink size={14} /> Jira
@@ -141,24 +195,162 @@ function Header({ task: t, onResumed }: { task: Task; onResumed: () => void }) {
           </span>
           <span><FolderGit2 size={15} /> основний: <b>{t.repo_name}</b></span>
           <span><Clock size={15} /> створено {dateTime(t.created_at)}</span>
-          <span><Coins size={15} /> <b>{money(t.total_cost_usd)}</b></span>
+          <span title={COST_HINT}><Coins size={15} /> <b>{money(t.total_cost_usd)}</b></span>
         </div>
         {error && <div className="error-bar">{error}</div>}
       </div>
 
-      {t.status !== 'COMPLETED' && (
-        <div className="stack" style={{ alignItems: 'flex-end', gap: 8 }}>
-          <button className={`btn ${t.status === 'FAILED' ? 'btn-primary' : 'btn-soft'}`} onClick={resume} disabled={busy}>
-            {busy ? <RefreshCw size={16} className="spin" /> : <RotateCcw size={16} />}
-            {t.status === 'FAILED' ? 'Перезапустити' : confirm ? 'Так, продовжити' : 'Продовжити'}
+      <div className="stack" style={{ alignItems: 'flex-end', gap: 8 }}>
+        {t.running ? (
+          <button className="btn btn-soft" onClick={stop} disabled={stopping || deleting}>
+            {stopping ? <RefreshCw size={16} className="spin" /> : <Square size={16} />}
+            {stopping ? 'Зупиняю…' : 'Зупинити'}
           </button>
-          {confirm && (
-            <span className="muted" style={{ fontSize: 12.5, maxWidth: 260, textAlign: 'right' }}>
-              Продовжуй, лише якщо задача зараз не виконується (наприклад, контейнер перезапускали).
-            </span>
+        ) : t.status !== 'COMPLETED' && !isWaiting(t.status) && (
+          <button className="btn btn-primary" onClick={resume} disabled={busy || deleting}>
+            {busy ? <RefreshCw size={16} className="spin" /> : <RotateCcw size={16} />}
+            {t.status === 'FAILED' ? 'Перезапустити' : 'Продовжити'}
+          </button>
+        )}
+        <div style={{ display: 'flex', gap: 8 }}>
+          {confirmDelete && (
+            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmDelete(false)} disabled={deleting}>
+              Скасувати
+            </button>
           )}
+          <button className={`btn btn-sm ${confirmDelete ? 'btn-danger' : 'btn-ghost'}`} onClick={remove}
+            disabled={deleting || busy || t.running} title={t.running ? 'Спершу зупини задачу' : undefined}>
+            {deleting ? <RefreshCw size={14} className="spin" /> : <Trash2 size={14} />}
+            {confirmDelete ? 'Так, видалити' : 'Видалити'}
+          </button>
+        </div>
+        {confirmDelete && (
+          <span className="muted" style={{ fontSize: 12.5, maxWidth: 280, textAlign: 'right' }}>
+            Буде видалено гілку <span className="mono">{t.branch_name}</span> з комітами в усіх репозиторіях,
+            worktree та всю історію задачі. Якщо гілку вже замерджено в main — видалення буде відхилено.
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ───────────────────────────── План ─────────────────────────────
+
+function PlanTab({ task: t, onChanged }: { task: Task; onChanged: () => void }) {
+  const reworking = t.status === 'IN_PLANNING' && Boolean(t.plan_feedback)
+
+  if (!t.plan) {
+    return (
+      <div className="card">
+        <div className="empty">
+          <div className="empty-art"><DraftingCompass size={32} /></div>
+          <h3>{t.status === 'IN_PLANNING' ? 'Архітектор складає план' : 'Плану немає'}</h3>
+          <p>
+            {t.status === 'IN_PLANNING'
+              ? 'Він досліджує код і готує план: що зміниться, флоу запиту, алгоритм та integration-тести. Що він робить зараз — у вкладці «Живий журнал».'
+              : 'Задачу створено до появи Архітектора — вона пішла одразу на розробку.'}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="stack">
+      {reworking && (
+        <div className="callout tone-amber">
+          <PencilLine size={18} />
+          <div className="callout-body">
+            <div className="callout-title">Архітектор переробляє план з урахуванням твоїх правок</div>
+            <Markdown text={t.plan_feedback} />
+          </div>
         </div>
       )}
+
+      <div className="card card-pad">
+        <div className="card-title">
+          <DraftingCompass size={18} />
+          <h3>{reworking ? `Попередня версія плану (${t.plan_revision})` : `План · версія ${t.plan_revision}`}</h3>
+          {t.plan_approved_at && (
+            <span className="badge tone-green"><Check size={14} /> схвалено {dateTime(t.plan_approved_at)}</span>
+          )}
+        </div>
+        <div className="plan-doc"><Markdown text={t.plan} /></div>
+      </div>
+
+      {isWaiting(t.status) && <PlanDecision task={t} onChanged={onChanged} />}
+    </div>
+  )
+}
+
+// Рішення щодо плану: схвалити (→ розробка) або надіслати правки (→ Архітектор переробляє).
+function PlanDecision({ task: t, onChanged }: { task: Task; onChanged: () => void }) {
+  const [comment, setComment] = useState('')
+  const [busy, setBusy] = useState<'approve' | 'revise' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  async function decide(kind: 'approve' | 'revise') {
+    setBusy(kind)
+    setError(null)
+    try {
+      if (kind === 'approve') await api.approvePlan(t.id)
+      else await api.revisePlan(t.id, comment)
+      setComment('')
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="card card-pad">
+      <div className="card-title"><ClipboardCheck size={18} /><h3>Твоє рішення</h3></div>
+      <div className="field" style={{ marginBottom: 0 }}>
+        <label htmlFor="plan-comment">Правки до плану</label>
+        <textarea
+          id="plan-comment"
+          className="input textarea"
+          placeholder="Що змінити: інший підхід, чого бракує, які тести додати… Архітектор перепише план з урахуванням кожного пункту."
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          disabled={busy !== null}
+        />
+        <span className="hint">Якщо все влаштовує — просто натисни «Схвалити». Після цього задача піде на розробку за цим планом.</span>
+      </div>
+      {error && <div className="error-bar" style={{ marginTop: 12 }}>{error}</div>}
+      <div className="plan-actions">
+        <button className="btn btn-soft" onClick={() => decide('revise')} disabled={busy !== null || !comment.trim()}>
+          {busy === 'revise' ? <RefreshCw size={16} className="spin" /> : <Send size={16} />}
+          Надіслати правки
+        </button>
+        <button className="btn btn-primary" onClick={() => decide('approve')} disabled={busy !== null || Boolean(comment.trim())}
+          title={comment.trim() ? 'Є ненадіслані правки — надішли їх або очисти поле' : undefined}>
+          {busy === 'approve' ? <RefreshCw size={16} className="spin" /> : <Check size={16} />}
+          Схвалити і почати розробку
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Пояснення для зупиненої задачі: з чого почнеться «Продовжити».
+function StoppedNote({ task: t }: { task: Task }) {
+  const role = ROLE[t.agent_role]
+  return (
+    <div className="callout tone-neutral">
+      <CirclePause size={18} />
+      <div className="callout-body">
+        <div className="callout-title">Задачу зупинено</div>
+        {t.agent_session && role ? (
+          <>«Продовжити» відновить сесію агента <b>{role.label}</b> з того місця, де його зупинили,
+            — він пам'ятає все, що вже зробив.</>
+        ) : (
+          <>«Продовжити» запустить поточний етап заново — збереженої сесії агента немає.</>
+        )}
+      </div>
     </div>
   )
 }
@@ -166,7 +358,7 @@ function Header({ task: t, onResumed }: { task: Task; onResumed: () => void }) {
 // ───────────────────────────── Огляд ─────────────────────────────
 
 function Overview({ task: t, logs }: { task: Task; logs: TaskLog[] }) {
-  const runs = logs.filter((l) => l.agent_role !== 'orchestrator')
+  const runs = logs.filter((l) => l.agent_role !== 'orchestrator' && l.agent_role !== 'operator')
   const agentMs = runs.reduce((s, l) => s + l.duration_ms, 0)
   const turns = runs.reduce((s, l) => s + l.num_turns, 0)
   const reviews = runs.filter((l) => l.agent_role === 'reviewer').length
@@ -222,7 +414,7 @@ function Overview({ task: t, logs }: { task: Task; logs: TaskLog[] }) {
             <dt>Запусків агентів</dt><dd>{runs.length}</dd>
             <dt>Кроків агентів</dt><dd>{turns}</dd>
             <dt>Час роботи агентів</dt><dd>{agentMs ? duration(agentMs) : '—'}</dd>
-            <dt>Вартість</dt><dd>{money(t.total_cost_usd)}</dd>
+            <dt title={COST_HINT}>Умовна вартість</dt><dd title={COST_HINT}>{money(t.total_cost_usd)}</dd>
             <dt>Змінено репозиторіїв</dt><dd>{t.changed_repos} з {(t.repos ?? []).length}</dd>
             <dt>Оновлено</dt><dd>{timeAgo(t.updated_at)}</dd>
             {t.completed_at && (<><dt>Завершено</dt><dd>{dateTime(t.completed_at)}</dd></>)}
@@ -240,7 +432,7 @@ function Timeline({ logs, loading }: { logs: TaskLog[]; loading: boolean }) {
   const groups = useMemo(() => {
     const map = new Map<number, TaskLog[]>()
     for (const l of logs) {
-      const key = l.iteration || 1
+      const key = l.iteration ?? 1 // 0 — планування (до першої ітерації розробки)
       map.set(key, [...(map.get(key) ?? []), l])
     }
     return [...map.entries()].sort((a, b) => a[0] - b[0])
@@ -264,7 +456,7 @@ function Timeline({ logs, loading }: { logs: TaskLog[]; loading: boolean }) {
       {groups.map(([iteration, runs]) => (
         <section key={iteration}>
           <div className="iteration-head">
-            <h2>Ітерація {iteration}</h2>
+            <h2>{iteration === 0 ? 'План' : `Ітерація ${iteration}`}</h2>
             <div className="line" />
           </div>
           <div className="runs">
@@ -276,10 +468,18 @@ function Timeline({ logs, loading }: { logs: TaskLog[]; loading: boolean }) {
   )
 }
 
+// Заголовок підсумку кроку в хронології — залежить від ролі агента.
+const BRIEF_TITLE: Record<string, string> = {
+  developer: 'Що зроблено',
+  reviewer: "Підсумок рев'ю",
+  tester: 'Що перевірено',
+}
+
 function Run({ log: l }: { log: TaskLog }) {
   const role = ROLE[l.agent_role] ?? ROLE.orchestrator
   const tone = VERDICT[l.verdict]?.tone ?? role.tone
   const isError = l.agent_role === 'orchestrator'
+  const isOperator = l.agent_role === 'operator' // рішення людини щодо плану
 
   return (
     <div className="run">
@@ -295,27 +495,53 @@ function Run({ log: l }: { log: TaskLog }) {
             <span><Clock size={14} /> {dateTime(l.created_at)}</span>
             {l.duration_ms > 0 && <span><Timer size={14} /> {duration(l.duration_ms)}</span>}
             {l.num_turns > 0 && <span><Footprints size={14} /> {l.num_turns} {plural(l.num_turns, 'крок', 'кроки', 'кроків')}</span>}
-            {l.cost_usd > 0 && <span><Coins size={14} /> {money(l.cost_usd)}</span>}
+            {l.cost_usd > 0 && <span title={COST_HINT}><Coins size={14} /> {money(l.cost_usd)}</span>}
+            {l.session_mode === 'resume' && (
+              <span title="Задача повернулась до ролі — агент продовжив свою попередню сесію (claude --resume)">
+                <RotateCcw size={14} /> продовжив свою сесію
+              </span>
+            )}
+            {l.session_mode === 'continue' && (
+              <span title="Агент відновив сесію, на якій задачу зупинили"><CirclePause size={14} /> відновив після зупинки</span>
+            )}
           </div>
         </div>
 
         <div className="run-body">
-          {isError ? (
+          {isOperator ? (
+            <div className="muted">{l.summary}</div>
+          ) : isError ? (
             <div className="callout tone-red">
               <TriangleAlert size={18} />
               <div className="callout-body mono" style={{ whiteSpace: 'pre-wrap' }}>{l.summary}</div>
             </div>
+          ) : l.brief ? (
+            <div className={`callout tone-${role.tone}`}>
+              <ListChecks size={18} />
+              <div className="callout-body">
+                <div className="callout-title">{BRIEF_TITLE[l.agent_role] ?? 'Коротко'}</div>
+                <Markdown text={l.brief} />
+              </div>
+            </div>
           ) : (
+            // Старі записи (до появи підсумку) — показуємо повну відповідь, як раніше.
             l.summary && <Clamp text={l.summary} />
           )}
 
           {l.feedback && (
             <div className="file-card">
-              <div className="file-card-head"><FileText size={14} /> review_feedback.md</div>
+              <div className="file-card-head">
+                <FileText size={14} /> {isOperator ? 'Твої правки до плану' : 'review_feedback.md'}
+              </div>
               <div className="file-card-body"><Clamp text={l.feedback} limit={1200} /></div>
             </div>
           )}
 
+          {l.brief && l.summary && (
+            <Fold title="Повна відповідь агента">
+              <div className="fold-body-md"><Markdown text={l.summary} /></div>
+            </Fold>
+          )}
           {l.prompt && <Fold title="Завдання, яке отримав агент" text={l.prompt} />}
           {l.output_log && <Fold title="Журнал дій агента" text={l.output_log} />}
         </div>
@@ -324,11 +550,11 @@ function Run({ log: l }: { log: TaskLog }) {
   )
 }
 
-function Fold({ title, text }: { title: string; text: string }) {
+function Fold({ title, text, children }: { title: string; text?: string; children?: React.ReactNode }) {
   return (
     <details className="fold">
       <summary><ChevronRight size={16} className="chev" /> {title}</summary>
-      <div className="fold-body"><pre className="code">{text}</pre></div>
+      <div className="fold-body">{children ?? <pre className="code">{text}</pre>}</div>
     </details>
   )
 }
@@ -414,7 +640,7 @@ function DiffLine({ line }: { line: string }) {
 
 // ───────────────────────────── Живий журнал ─────────────────────────────
 
-function Live({ id, running }: { id: string; running: boolean }) {
+function Live({ id, running, stopped, waiting }: { id: string; running: boolean; stopped: boolean; waiting: boolean }) {
   const { data, error } = usePolling(`activity-${id}`, () => api.activity(id), 2500, running)
   const box = useRef<HTMLDivElement>(null)
   const stick = useRef(true) // тримаємося низу, поки користувач не прокрутив угору
@@ -441,7 +667,11 @@ function Live({ id, running }: { id: string; running: boolean }) {
           <Activity size={18} />
           <h3>Що роблять агенти</h3>
         </div>
-        {running ? (
+        {waiting ? (
+          <span className="badge tone-accent"><ClipboardCheck size={14} /> чекає на твоє рішення</span>
+        ) : stopped ? (
+          <span className="badge tone-neutral"><CirclePause size={14} /> зупинено</span>
+        ) : running ? (
           <span className="badge tone-green"><span className="pulse" /> наживо</span>
         ) : (
           <span className="badge tone-neutral">задача завершена</span>

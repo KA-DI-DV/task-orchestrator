@@ -37,3 +37,9 @@ export function plural(n: number, one: string, few: string, many: string): strin
   if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
   return many
 }
+
+// Підказка до сум: Claude Code рахує вартість токенів за цінами API,
+// навіть коли працює через підписку — тоді реально нічого не списується.
+export const COST_HINT =
+  'Скільки коштувала б ця робота за цінами Anthropic API. З підпискою Pro/Max гроші не списуються — ' +
+  'це лише міра того, скільки ліміту підписки витратили агенти.'

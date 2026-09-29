@@ -1,9 +1,15 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // Рядки у форматі `claude -p --output-format stream-json --verbose`.
@@ -42,5 +48,65 @@ func TestResultEvent(t *testing.T) {
 	}
 	if ev.Type != "result" || ev.Result != "Готово\nVERDICT: APPROVE" || ev.NumTurns != 7 || ev.TotalCostUSD != 0.42 {
 		t.Errorf("неправильно розібрано: %+v", ev)
+	}
+}
+
+// fakeClaude — скрипт замість claude: записує свої аргументи в args.txt,
+// друкує подію result і, якщо в завданні є "wait", чекає, поки його зупинять.
+func fakeClaude(t *testing.T) (binary, argsFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	argsFile = filepath.Join(dir, "args.txt")
+	binary = filepath.Join(dir, "claude")
+	script := `#!/bin/sh
+echo "$@" > ` + argsFile + `
+case "$2" in
+  wait) trap 'exit 130' INT; while true; do sleep 0.1; done ;;
+esac
+echo '{"type":"result","result":"ok","num_turns":1}'
+`
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, argsFile
+}
+
+func TestRunSessionFlags(t *testing.T) {
+	bin, argsFile := fakeClaude(t)
+	r := &Runner{Binary: bin, Timeout: 10 * time.Second}
+
+	for _, tc := range []struct {
+		resume bool
+		want   string
+	}{
+		{false, "--session-id s-1"},
+		{true, "--resume s-1"},
+	} {
+		if _, err := r.Run(context.Background(), Request{Prompt: "go", WorkDir: t.TempDir(), SessionID: "s-1", Resume: tc.resume}); err != nil {
+			t.Fatal(err)
+		}
+		args, _ := os.ReadFile(argsFile)
+		if !strings.Contains(string(args), tc.want) {
+			t.Errorf("resume=%v: аргументи %q, очікував %q", tc.resume, args, tc.want)
+		}
+	}
+}
+
+// Зупинка: агент отримує Ctrl+C, а Run повертає причину зупинки.
+func TestRunStop(t *testing.T) {
+	bin, _ := fakeClaude(t)
+	r := &Runner{Binary: bin, Timeout: 10 * time.Second}
+	stopped := errors.New("зупинено")
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	time.AfterFunc(300*time.Millisecond, func() { cancel(stopped) })
+
+	started := time.Now()
+	_, err := r.Run(ctx, Request{Prompt: "wait", WorkDir: t.TempDir()})
+	if !errors.Is(err, stopped) {
+		t.Fatalf("Run = %v, очікував помилку з причиною %q", err, stopped)
+	}
+	if d := time.Since(started); d > 5*time.Second {
+		t.Errorf("агент зупинявся %s — Ctrl+C не спрацював, чекали WaitDelay", d)
 	}
 }

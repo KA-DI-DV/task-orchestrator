@@ -40,6 +40,12 @@ type Request struct {
 	SystemInstruction string   // додаткові інструкції ролі
 	Model             string   // необов'язково: "opus", "sonnet", ...
 	ExtraFlags        []string // прапорці з config.yaml (наприклад --dangerously-skip-permissions)
+
+	// SessionID — id сесії claude. Новий запуск створює сесію з цим id
+	// (--session-id), а з Resume = true — продовжує наявну (--resume):
+	// агент бачить усю свою попередню розмову і дії.
+	SessionID string
+	Resume    bool
 }
 
 // Result — результат роботи агента.
@@ -104,9 +110,20 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 	// "..." розгортає слайс у окремі аргументи.
 	args = append(args, req.ExtraFlags...)
+	if req.SessionID != "" {
+		if req.Resume {
+			args = append(args, "--resume", req.SessionID)
+		} else {
+			args = append(args, "--session-id", req.SessionID)
+		}
+	}
 
 	cmd := exec.CommandContext(ctx, r.Binary, args...)
 	cmd.Dir = req.WorkDir
+	// Коли задачу зупиняють (або вийшов таймаут), спершу просимо claude
+	// завершитись (Ctrl+C), щоб він дописав сесію, і лише через 10 с вбиваємо.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 10 * time.Second
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -120,7 +137,11 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 	defer activity.Close()
 
 	slog.Info("запускаю агента", "role", req.Role, "dir", req.WorkDir)
-	activity.write(req.Role, fmt.Sprintf("▶ старт (%s)", req.WorkDir))
+	start := fmt.Sprintf("▶ старт (%s)", req.WorkDir)
+	if req.Resume {
+		start = fmt.Sprintf("▶ відновлюю сесію %s (%s)", req.SessionID, req.WorkDir)
+	}
+	activity.write(req.Role, start)
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("не вдалося запустити %s: %w", r.Binary, err)
@@ -159,6 +180,10 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 	finalJSON, _ := json.Marshal(final)
 	result.RawLog = journal.String() + "\n--- result ---\n" + string(finalJSON) + "\n--- stderr ---\n" + stderr.String()
 
+	if errors.Is(ctx.Err(), context.Canceled) {
+		activity.write(req.Role, "⏸ зупинено")
+		return result, fmt.Errorf("агента %s зупинено: %w", req.Role, context.Cause(ctx))
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		activity.write(req.Role, "⏱ перевищено таймаут")
 		return result, fmt.Errorf("агент %s не вклався у %s", req.Role, r.Timeout)

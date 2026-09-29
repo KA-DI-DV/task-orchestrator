@@ -1,14 +1,18 @@
 import type { Status } from '../api'
-import { isFinal } from '../api'
+import { isFinal, isWaiting } from '../api'
+import { CirclePause } from 'lucide-react'
 import { ROLE, STATUS, VERDICT } from '../meta'
 
-export function StatusBadge({ status, large }: { status: Status; large?: boolean }) {
+// stopped — задача зупинилась посеред етапу: показуємо паузу замість «пульсу».
+// Задача, що чекає на людину (план на апруві), теж без «пульсу» — агенти не працюють.
+export function StatusBadge({ status, large, stopped }: { status: Status; large?: boolean; stopped?: boolean }) {
   const m = STATUS[status]
   const Icon = m.icon
+  const size = large ? 16 : 14
   return (
-    <span className={`badge tone-${m.tone} ${large ? 'badge-lg' : ''}`}>
-      {isFinal(status) ? <Icon size={large ? 16 : 14} /> : <span className="pulse" />}
-      {m.label}
+    <span className={`badge tone-${stopped ? 'neutral' : m.tone} ${large ? 'badge-lg' : ''}`}>
+      {stopped ? <CirclePause size={size} /> : isFinal(status) || isWaiting(status) ? <Icon size={size} /> : <span className="pulse" />}
+      {stopped ? `Зупинено · ${m.label}` : m.label}
     </span>
   )
 }
