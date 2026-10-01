@@ -30,6 +30,9 @@ services:
         required: false
     environment:
       DATABASE_URL: postgres://orchestrator:orchestrator_secret_password@postgres:5432/orchestrator_db?sslmode=disable
+    # privileged — щоб усередині контейнера працював власний Docker Engine:
+    # на ньому QA-агент піднімає kind-кластер (local-development/cluster/start-cluster.sh).
+    privileged: true
     volumes:
       # Репозиторії з Mac (шлях задається в .env як REPOS_DIR).
       - ${REPOS_DIR:-~/Projects}:/workspaces
@@ -43,6 +46,8 @@ services:
       # Конфіг і MCP можна міняти без перезбирання образу.
       - ./apps/orchestrator/config.yaml:/app/config.yaml:ro
       - ./apps/orchestrator/mcp:/app/mcp:ro
+      # Образи і шари Docker Engine всередині контейнера (кеш збірок для кластера).
+      - docker_data:/var/lib/docker
     restart: unless-stopped
 
   # Адмін-панель (React). nginx роздає зібраний застосунок і проксує /api до оркестратора.
@@ -59,3 +64,4 @@ volumes:
   postgres_data:
   worktrees:
   claude_home:
+  docker_data:

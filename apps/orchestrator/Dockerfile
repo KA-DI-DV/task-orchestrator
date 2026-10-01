@@ -24,6 +24,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# Тестове середовище QA: local-development/cluster/start-cluster.sh піднімає kind-кластер.
+# Docker Engine працює прямо в контейнері (Docker-in-Docker, контейнер privileged —
+# див. docker-compose.yml): так kind-вузли бачать worktree задачі за тими самими шляхами,
+# а порти кластера (port-forward) відкриваються в цьому ж контейнері, поруч з Browser MCP.
+# netcat і procps (pkill) скрипт теж використовує.
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg netcat-openbsd procps \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+    && rm -rf /var/lib/apt/lists/* \
+    && usermod -aG docker node
+
+# kind, kubectl, helm (Helm 4 — скрипт розрахований на нього).
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSLo /usr/local/bin/kind "https://github.com/kubernetes-sigs/kind/releases/latest/download/kind-linux-${ARCH}" \
+    && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
+    && chmod +x /usr/local/bin/kind /usr/local/bin/kubectl \
+    && curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | HELM_INSTALL_DIR=/usr/local/bin bash \
+    && kind version && kubectl version --client && helm version --short
+
 # Claude Code CLI + Playwright MCP (щоб не качати його через npx при кожному запуску).
 RUN npm install -g @anthropic-ai/claude-code @playwright/mcp
 
@@ -56,11 +79,13 @@ WORKDIR /app
 COPY --from=builder /out/orchestrator /usr/local/bin/orchestrator
 COPY config.yaml /app/config.yaml
 COPY mcp /app/mcp
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# Claude Code забороняє --dangerously-skip-permissions під root,
-# тому працюємо від звичайного користувача node (є в образі node).
+# Claude Code забороняє --dangerously-skip-permissions під root, тому оркестратор
+# працює від звичайного користувача node (є в образі node). Контейнер стартує під root
+# лише для того, щоб entrypoint.sh запустив dockerd, — а потім переходить на node.
 RUN mkdir -p /tmp/workspaces /home/node/.claude && chown -R node:node /tmp/workspaces /home/node/.claude
-USER node
 
 EXPOSE 8080
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["orchestrator"]

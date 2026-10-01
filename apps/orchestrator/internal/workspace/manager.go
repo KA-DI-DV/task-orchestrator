@@ -95,8 +95,15 @@ func (m *Manager) Create(ctx context.Context, repoName, taskKey string) (path, b
 	}
 
 	// Worktree вже є — нічого не робимо.
-	if _, statErr := os.Stat(path); statErr == nil {
+	if _, statErr := os.Stat(filepath.Join(path, ".git")); statErr == nil {
 		return path, baseCommit, false, nil
+	}
+	// Папка є, але це не worktree (наприклад, порожня папка, яку створив Docker для
+	// bind-mount kind-вузла) — прибираємо її, інакше git worktree add не спрацює.
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := os.RemoveAll(path); err != nil {
+			return "", "", false, fmt.Errorf("%s існує, але це не worktree, і видалити її не вдалося: %w", path, err)
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -118,6 +125,62 @@ func (m *Manager) Create(ctx context.Context, repoName, taskKey string) (path, b
 		return "", "", false, err
 	}
 	return path, baseCommit, newBranch, nil
+}
+
+// CopyIgnored копіює з основної копії репозиторію у worktree файли й папки,
+// яких немає в git (.gitignore) — наприклад, локальні конфіги. paths — відносно
+// кореня репозиторію. Чого немає в основній копії, пропускаємо; те, що вже є
+// у worktree, не перезаписуємо (агент міг це змінити).
+func (m *Manager) CopyIgnored(repoName, worktree string, paths []string) error {
+	repo := m.RepoPath(repoName)
+	for _, rel := range paths {
+		src := filepath.Join(repo, rel)
+		info, err := os.Stat(src)
+		if err != nil {
+			continue // у цьому репозиторії такого немає
+		}
+		dst := filepath.Join(worktree, rel)
+		if !info.IsDir() {
+			err = copyFileIfMissing(src, dst, info.Mode())
+		} else {
+			err = filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				sub, _ := filepath.Rel(src, path)
+				target := filepath.Join(dst, sub)
+				if d.IsDir() {
+					return os.MkdirAll(target, 0o755)
+				}
+				if !d.Type().IsRegular() {
+					return nil // симлінки та інше не копіюємо
+				}
+				fi, err := d.Info()
+				if err != nil {
+					return err
+				}
+				return copyFileIfMissing(path, target, fi.Mode())
+			})
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+func copyFileIfMissing(src, dst string, mode os.FileMode) error {
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, mode.Perm())
 }
 
 // CommitsSince рахує коміти в dir від base до HEAD.

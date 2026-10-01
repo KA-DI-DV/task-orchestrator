@@ -254,21 +254,22 @@ func reviewerPlanRules(t *storage.Task) string {
 		"  відсутні integration-тести з плану — теж зауваження)"
 }
 
-func testerPrompt(t *storage.Task, changed []storage.TaskRepo) string {
+func testerPrompt(t *storage.Task, changed []storage.TaskRepo, testEnv string) string {
 	return fmt.Sprintf(`Ти — QA-інженер. Перевір, що задача нижче реалізована і працює.
 
 %s%s%s
-%s%s
+%s%s%s
 ## Що зробити
 1. У кожному зміненому репозиторії знайди і запусти локальні тести (unit/integration).%s
 2. Якщо в проєкті є веб-інтерфейс і тобі доступний Browser MCP (Playwright) —
-   запусти застосунок і перевір UI-сценарії з опису задачі в headless-режимі.
+   %s і перевір UI-сценарії з опису задачі в headless-режимі.
 3. Можеш дописати відсутні тести, але не змінюй бізнес-логіку.
 %s
 ## Формат відповіді (обов'язково)
 Коротко опиши, що перевірено і з яким результатом, додай розділ «%s», а останнім рядком напиши рівно:
 %s %s — якщо все працює, або %s %s — якщо є проблеми.
-`, taskHeader(t), workspaceSection(t), planSection(t), diffSection(changed), testInstructionsSection(t), testerPlanRules(t),
+`, taskHeader(t), workspaceSection(t), planSection(t), diffSection(changed), testInstructionsSection(t),
+		testEnvSection(t, testEnv), testerPlanRules(t), testerAppStep(testEnv),
 		briefSection(
 			"які автотести запускав і з яким результатом (скільки пройшло / впало);",
 			"які сценарії перевіряв вручну або в браузері;",
@@ -276,6 +277,46 @@ func testerPrompt(t *storage.Task, changed []storage.TaskRepo) string {
 			"що не працює, якщо є проблеми.",
 		), briefHeading,
 		testPrefix, testPassed, testPrefix, testFailed)
+}
+
+// testEnvSection — як підняти тестове середовище (кластер) перед тестуванням.
+// testEnv — повний шлях до скрипта в worktree задачі; "" — середовища немає.
+func testEnvSection(t *storage.Task, testEnv string) string {
+	if testEnv == "" {
+		return ""
+	}
+	logFile := "/tmp/test-env-" + t.ID + ".log"
+	return fmt.Sprintf(`
+## Тестове середовище (обов'язково, перед перевірками)
+Застосунок тестуй у локальному середовищі, яке піднімає скрипт:
+  %[1]s
+Він лежить у worktree задачі, тож збирає і запускає код саме з гілки %[2]s
+(репозиторії — сусідні папки поруч зі скриптом). Скрипт збирає образи і піднімає кластер —
+це довго (10–30 хвилин), а Bash-команда обривається через 10 хвилин. Тому:
+1. Запусти його у фоні з логом, обов'язково з --recreate (кластер, що лишився від попереднього
+   запуску, бачить старі папки worktree, а не код цієї гілки):
+     ( %[1]s --recreate; echo "TEST_ENV_EXIT=$?" ) > %[3]s 2>&1 &
+2. Ти працюєш у неінтерактивному режимі: коли твоя відповідь закінчується, сесія завершується
+   назавжди, а сповіщення фонових задач уже не прийдуть. Тому чекай сам і НЕ завершуй
+   відповідь, доки середовище не готове і перевірки не зроблені. Не запускай очікування через
+   run_in_background — лише звичайною командою, коротшою за 10 хвилин, і повторюй її, доки
+   в лозі не з'явиться рядок TEST_ENV_EXIT=:
+     timeout 540 sh -c 'until grep -q TEST_ENV_EXIT= %[3]s; do sleep 15; done'; tail -n 30 %[3]s
+   Поки скрипт працює, можеш між очікуваннями запускати unit-тести.
+3. TEST_ENV_EXIT=0 — середовище готове: адреси сервісів скрипт пише наприкінці логу.
+4. Інша ненульова помилка — розберись за логом. Якщо середовище не піднімається через код
+   задачі (міграції, сервіс падає на старті) — це FAILED. Якщо через інфраструктуру (немає docker,
+   бракує образу) — теж FAILED, але чітко напиши у звіті, що код не вдалося перевірити і чому.
+Кластер сам не видаляй — після тестування це зробить оркестратор.
+`, testEnv, t.BranchName, logFile)
+}
+
+// testerAppStep — як QA має запускати застосунок для UI-перевірок.
+func testerAppStep(testEnv string) string {
+	if testEnv != "" {
+		return "відкривай застосунок у середовищі, яке підняв скрипт (адреси — наприкінці його логу),"
+	}
+	return "запусти застосунок"
 }
 
 // testInstructionsSection — інструкції людини, коли тестування перезапустили вручну.

@@ -87,6 +87,9 @@ func newApp(ctx context.Context, configPath string) (*App, error) {
 			CleanupWorktree: cfg.Orchestrator.CleanupWorktree,
 			MainRepo:        cfg.Orchestrator.MainRepo,
 			ExcludeRepos:    cfg.Orchestrator.ExcludeRepos,
+			WorktreeCopy:    cfg.Orchestrator.WorktreeCopy,
+			TestEnvScript:   cfg.Orchestrator.TestEnvScript,
+			TestEnvCleanup:  cfg.Orchestrator.TestEnvCleanup,
 		},
 	}, nil
 }

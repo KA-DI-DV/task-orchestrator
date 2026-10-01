@@ -222,3 +222,35 @@ func TestDiscardChanges(t *testing.T) {
 		t.Error("новий файл не видалено")
 	}
 }
+
+func TestCopyIgnored(t *testing.T) {
+	m := &Manager{ReposBaseDir: t.TempDir()}
+	repo := m.RepoPath("backend")
+	worktree := t.TempDir()
+	write := func(path, content string) {
+		t.Helper()
+		_ = os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(repo, "config", "play", "server.json"), "from-repo")
+	write(filepath.Join(repo, ".env"), "A=1")
+	// Уже є у worktree — не перезаписуємо.
+	write(filepath.Join(worktree, "config", "session.json"), "agent-edit")
+	write(filepath.Join(repo, "config", "session.json"), "from-repo")
+
+	if err := m.CopyIgnored("backend", worktree, []string{"config", ".env", "missing"}); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"config/play/server.json": "from-repo",
+		".env":                    "A=1",
+		"config/session.json":     "agent-edit",
+	} {
+		got, err := os.ReadFile(filepath.Join(worktree, path))
+		if err != nil || string(got) != want {
+			t.Errorf("%s = %q (%v), очікував %q", path, got, err, want)
+		}
+	}
+}

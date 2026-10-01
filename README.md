@@ -82,6 +82,17 @@ curl localhost:8080/healthz # {"status":"ok"}
 
 Для **всіх інших** git-репозиторіїв з `REPOS_DIR` створюється worktree на гілці `feature/<KEY>`
 від їхнього поточного HEAD. Список фіксується на старті задачі (таблиця `task_repos`).
+Файли з `worktree_copy` (локальні конфіги, яких немає в git: `config/`, `k8s/local/config/`, `.env`)
+копіюються з твоєї копії репозиторію в кожен worktree.
+
+**Кластер для QA.** Перед тестуванням QA-агент запускає `test_env_script`
+(`local-development/cluster/start-cluster.sh` з worktree задачі): він збирає образи з гілки задачі
+і піднімає kind-кластер. Для цього в контейнері оркестратора працює власний Docker Engine
+(тому контейнер `privileged`, образи кешуються у volume `docker_data`), а kind, kubectl і helm
+встановлено в образі. Кластер один на всіх, тож QA різних задач чекають одне на одного.
+Образи MinIO з docker.io анонімно не завантажуються — один раз передай їх з Mac:
+`task images:minio`. Стан кластера — `task cluster`.
+Docker Desktop має мати достатньо ресурсів для кластера (рекомендовано від 12 ГБ пам'яті).
 
 ## 2. Запуск задачі
 

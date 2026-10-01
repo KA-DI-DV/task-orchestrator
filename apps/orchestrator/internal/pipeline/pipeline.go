@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -74,6 +75,13 @@ type Pipeline struct {
 	CleanupWorktree bool
 	MainRepo        string   // основний репозиторій за замовчуванням
 	ExcludeRepos    []string // репозиторії, для яких не створюється worktree
+	WorktreeCopy    []string // gitignored-файли, які копіюються в кожен worktree
+	TestEnvScript   string   // скрипт середовища для QA, відносно папки задачі
+	TestEnvCleanup  string   // команда, яка прибирає середовище після тестування
+
+	// testEnvMu — тестове середовище (кластер) одне на всіх: поки його
+	// використовує QA однієї задачі, QA інших задач чекає.
+	testEnvMu sync.Mutex
 
 	// running — які задачі зараз виконуються (або видаляються) в цьому процесі:
 	// ключ задачі → *runState. sync.Map — потокобезпечна мапа
@@ -482,6 +490,9 @@ func (p *Pipeline) createWorktrees(ctx context.Context, task *storage.Task) erro
 			return fmt.Errorf("worktree для %s: %w", r.RepoName, err)
 		}
 		r.WorktreePath = path
+		if err := p.Workspace.CopyIgnored(r.RepoName, path, p.WorktreeCopy); err != nil {
+			return fmt.Errorf("копіювання локальних файлів у worktree %s: %w", r.RepoName, err)
+		}
 		// При resume на наявній гілці лишаємо початковий base; якщо ж гілку
 		// створено заново (стару видалили як порожню) — base новий.
 		if newBranch || r.BaseCommit == "" {
@@ -626,7 +637,15 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	if err != nil {
 		return err
 	}
-	run, err := p.runAgent(ctx, task, "tester", testerPrompt(task, changed))
+	testEnv := p.testEnvScript(task)
+	if testEnv != "" {
+		p.testEnvMu.Lock()
+		defer p.testEnvMu.Unlock()
+		// defer виконуються у зворотному порядку: спершу прибираємо середовище,
+		// потім відпускаємо його для QA наступної задачі.
+		defer p.cleanupTestEnv(task)
+	}
+	run, err := p.runAgent(ctx, task, "tester", testerPrompt(task, changed, testEnv))
 	res := run.Result
 	instructions := task.TestInstructions // показуємо в хронології біля запуску
 	if err != nil {
@@ -660,6 +679,36 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 }
 
 // ───────────────────────────── Допоміжне ─────────────────────────────
+
+// cleanupTestEnv прибирає тестове середовище після роботи QA — навіть якщо
+// задачу зупинили, тому з власним контекстом.
+func (p *Pipeline) cleanupTestEnv(task *storage.Task) {
+	if p.TestEnvCleanup == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sh", "-c", p.TestEnvCleanup).CombinedOutput()
+	if err != nil {
+		slog.Warn("не вдалося прибрати тестове середовище", "key", task.ID, "error", err, "output", strings.TrimSpace(string(out)))
+		return
+	}
+	slog.Info("тестове середовище прибрано", "key", task.ID)
+}
+
+// testEnvScript — повний шлях до скрипта тестового середовища в worktree задачі,
+// або "", якщо скрипт не налаштовано чи його репозиторію немає серед репозиторіїв задачі.
+func (p *Pipeline) testEnvScript(task *storage.Task) string {
+	if p.TestEnvScript == "" {
+		return ""
+	}
+	path := filepath.Join(p.Workspace.WorktreesDir, task.ID, p.TestEnvScript)
+	if _, err := os.Stat(path); err != nil {
+		slog.Warn("скрипт тестового середовища не знайдено — QA тестуватиме без нього", "key", task.ID, "path", path)
+		return ""
+	}
+	return path
+}
 
 // AgentRoles — ролі агентів, які працюють над задачею (для налаштувань в адмін-панелі).
 var AgentRoles = []string{"architect", "developer", "reviewer", "tester"}

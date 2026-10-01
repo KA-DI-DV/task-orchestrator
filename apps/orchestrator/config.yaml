@@ -25,6 +25,16 @@ orchestrator:
   max_review_cycles: 3               # ліміт ітерацій Developer <-> Reviewer (Anti-Loop)
   agent_timeout: "45m"               # максимальний час одного запуску агента
   cleanup_worktree: true             # видаляти worktree після завершення (гілка лишається)
+  # Файли, яких немає в git (.gitignore), але без них нічого не запуститься:
+  # копіюються з основної копії кожного репозиторію (якщо там є) у worktree задачі.
+  worktree_copy: ["config", "k8s/local/config", ".env", "backend/.env"]
+  # QA-агент перед тестуванням піднімає цим скриптом kind-кластер з кодом гілки задачі.
+  # Шлях відносно папки задачі з worktree; потрібні docker/kind/kubectl/helm з Docker-образу.
+  test_env_script: "local-development/cluster/start-cluster.sh"
+  # Після тестування кластер видаляється: він займає багато пам'яті і монтує папки worktree,
+  # які оркестратор прибирає.
+  # [p] у шаблоні — щоб pkill не знайшов сам себе (рядок є і в командному рядку sh -c).
+  test_env_cleanup: "pkill -f 'kind-igaming -n igaming [p]ort-forward'; kind delete cluster --name igaming"
 
 roles:
   # Модель для architect / developer / reviewer / tester обирається в адмін-панелі

@@ -111,7 +111,7 @@ func TestPromptsAskForBrief(t *testing.T) {
 	for name, prompt := range map[string]string{
 		"developer": developerPrompt(task),
 		"reviewer":  reviewerPrompt(task, nil),
-		"tester":    testerPrompt(task, nil),
+		"tester":    testerPrompt(task, nil, ""),
 	} {
 		if !strings.Contains(prompt, "## "+briefHeading) {
 			t.Errorf("%s: у завданні немає вимоги до розділу %q", name, briefHeading)
@@ -156,7 +156,7 @@ func TestPlanInOtherPrompts(t *testing.T) {
 	checks := map[string]string{
 		"developer": developerPrompt(task),
 		"reviewer":  reviewerPrompt(task, nil),
-		"tester":    testerPrompt(task, nil),
+		"tester":    testerPrompt(task, nil, ""),
 	}
 	for role, prompt := range checks {
 		if !strings.Contains(prompt, "TestBetLimit") {
@@ -184,12 +184,26 @@ func TestExtractPlan(t *testing.T) {
 
 func TestTesterPromptInstructions(t *testing.T) {
 	task := &storage.Task{ID: "PROJ-1", BranchName: "feature/PROJ-1"}
-	if strings.Contains(testerPrompt(task, nil), "Додаткові інструкції") {
+	if strings.Contains(testerPrompt(task, nil, ""), "Додаткові інструкції") {
 		t.Error("без інструкцій розділу не має бути")
 	}
 	task.TestInstructions = "Перевір лише ручний перезапуск виплат"
-	prompt := testerPrompt(task, nil)
+	prompt := testerPrompt(task, nil, "")
 	for _, want := range []string{"Додаткові інструкції від людини (пріоритетні)", "Перевір лише ручний перезапуск виплат", "TEST_RESULT:"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("testerPrompt не містить %q", want)
+		}
+	}
+}
+
+func TestTesterPromptTestEnv(t *testing.T) {
+	task := &storage.Task{ID: "PROJ-1", BranchName: "feature/PROJ-1"}
+	if strings.Contains(testerPrompt(task, nil, ""), "Тестове середовище") {
+		t.Error("без скрипта розділу про середовище не має бути")
+	}
+	script := "/tmp/workspaces/PROJ-1/local-development/cluster/start-cluster.sh"
+	prompt := testerPrompt(task, nil, script)
+	for _, want := range []string{"Тестове середовище", script, "TEST_ENV_EXIT", "--recreate", "/tmp/test-env-PROJ-1.log"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("testerPrompt не містить %q", want)
 		}

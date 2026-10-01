@@ -61,6 +61,19 @@ tasks:
           [ -n "$s$c" ] && printf "== %s\n%s\n%s\n" "$(basename "$d")" "$c" "$s"
         done; true'
 
+  images:minio:
+    desc: "Передати в Docker оркестратора образи MinIO для кластера QA (docker.io їх анонімно не віддає; потрібні на Mac)"
+    cmds:
+      - |
+        for image in minio/minio:RELEASE.2025-04-22T22-12-26Z minio/mc:RELEASE.2025-04-16T18-13-26Z; do
+          docker save "$image" | docker compose exec -T orchestrator docker load
+        done
+
+  cluster:
+    desc: "Стан kind-кластера QA в контейнері оркестратора"
+    cmds:
+      - docker compose exec orchestrator sh -c 'kind get clusters; kubectl --context kind-igaming -n igaming get pods'
+
   test:
     desc: Запустити Go-тести (в Docker, локальний Go не потрібен)
     cmds:
