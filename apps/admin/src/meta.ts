@@ -47,6 +47,44 @@ export const VERDICT: Record<string, Meta> = {
   INTERRUPTED: { label: 'Перервано', tone: 'neutral', icon: CirclePause },
 }
 
+// Моделі Claude, які можна обрати для ролі (id — як їх приймає `claude --model`).
+// best — для яких ролей модель рекомендована (позначаємо ★ у списку).
+export interface ModelMeta {
+  label: string
+  price: string // за 1M токенів: вхід / вихід (ціни API; з підпискою — частка ліміту)
+  hint: string
+  best: string[]
+  warning?: string
+}
+
+export const MODELS: Record<string, ModelMeta> = {
+  'claude-fable-5-1': {
+    label: 'Fable 5.1',
+    price: '$10 / $50',
+    hint: 'Найпотужніша модель: найглибший аналіз коду і найкращі плани для складних задач. Найдорожча й найповільніша — варта того для Архітектора.',
+    best: ['architect'],
+    warning: 'На підписці потребує usage credits (докупленого використання). Без них агент з цією моделлю одразу впаде з помилкою.',
+  },
+  'claude-opus-5-5': {
+    label: 'Opus 5.5',
+    price: '$4 / $20',
+    hint: 'Сильна універсальна модель і вибір за замовчуванням. Добре планує, пише складний код і уважно рев’юїть — підходить для будь-якої ролі.',
+    best: ['architect', 'developer', 'reviewer'],
+  },
+  'claude-sonnet-5-5': {
+    label: 'Sonnet 5.5',
+    price: '$2 / $10',
+    hint: 'Швидша і вдвічі дешевша за Opus. Добре пише код за готовим планом і проганяє тести — розумна економія для Розробника і QA.',
+    best: ['developer', 'tester'],
+  },
+  'claude-haiku-4-5': {
+    label: 'Haiku 4.5',
+    price: '$1 / $5',
+    hint: 'Найшвидша і найдешевша. Годиться для простих перевірок і смоук-тестів, але слабка для складного коду, планів і рев’ю.',
+    best: [],
+  },
+}
+
 // Кроки конвеєра в порядку виконання (для степера).
 export const PIPELINE: Status[] = ['CREATED', 'IN_PLANNING', 'PLAN_REVIEW', 'IN_DEV', 'IN_REVIEW', 'IN_TEST', 'COMPLETED']
 

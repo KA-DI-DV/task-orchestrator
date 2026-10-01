@@ -60,7 +60,7 @@ type Result struct {
 // event — один рядок stream-json. Беремо лише потрібні поля —
 // решту JSON-декодер просто пропустить.
 type event struct {
-	Type    string `json:"type"` // system / assistant / user / result
+	Type    string `json:"type"` // system / assistant / user / rate_limit_event / result
 	Message struct {
 		Content []contentBlock `json:"content"`
 	} `json:"message"`
@@ -70,6 +70,9 @@ type event struct {
 	IsError      bool    `json:"is_error"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
 	NumTurns     int     `json:"num_turns"`
+
+	// Поле події "rate_limit_event": ліміти підписки (використання і час скидання).
+	RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 }
 
 // contentBlock — частина повідомлення: текст, виклик інструмента або його результат.
@@ -89,6 +92,23 @@ type Runner struct {
 	// LogDir — куди писати журнал дій агентів: <LogDir>/<TaskID>.log.
 	// Порожній — журнал не пишемо (лише slog).
 	LogDir string
+	// OnRateLimits викликається, коли claude повідомляє ліміти підписки
+	// (rate_limit_event — приходить на початку кожного запуску). Може бути nil.
+	OnRateLimits func(info json.RawMessage)
+}
+
+// CheckLimits робить найдешевший можливий запуск claude (haiku, один крок,
+// без MCP) лише заради свіжих лімітів — коли агенти давно не працювали.
+// Сам запуск теж трохи витрачає ліміт.
+func (r *Runner) CheckLimits(ctx context.Context) error {
+	_, err := r.Run(ctx, Request{
+		Role:       "limits",
+		WorkDir:    os.TempDir(),
+		Prompt:     "Reply with just: OK",
+		Model:      "haiku",
+		ExtraFlags: []string{"--max-turns", "1", "--strict-mcp-config"},
+	})
+	return err
 }
 
 // Run запускає агента і чекає, поки він закінчить.
@@ -160,6 +180,9 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 			if json.Unmarshal(line, &ev) == nil {
 				if ev.Type == "result" {
 					final = &ev
+				}
+				if ev.Type == "rate_limit_event" && len(ev.RateLimitInfo) > 0 && r.OnRateLimits != nil {
+					r.OnRateLimits(ev.RateLimitInfo)
 				}
 				for _, msg := range describe(&ev) {
 					slog.Info("агент", "role", req.Role, "do", msg)

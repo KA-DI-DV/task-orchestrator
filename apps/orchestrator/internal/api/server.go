@@ -10,10 +10,13 @@
 //	GET  /api/tasks/{id}/activity  — живий журнал дій агентів (останні рядки)
 //	POST /api/tasks/{id}/resume    — продовжити зупинену / перервану / впавшу задачу
 //	POST /api/tasks/{id}/stop      — зупинити виконання (сесію агента можна відновити)
+//	POST /api/tasks/{id}/retest    — повторно запустити QA {"instructions": "..."} (для готової / впалої задачі)
 //	POST /api/tasks/{id}/plan/approve — схвалити план Архітектора і почати розробку
 //	POST /api/tasks/{id}/plan/revise  — надіслати правки до плану {"comment": "..."}
 //	DELETE /api/tasks/{id}         — видалити задачу з гілками (якщо ще не в main)
 //	GET  /api/info                 — основний репозиторій і список репозиторіїв
+//	GET  /api/limits               — останні відомі ліміти підписки Claude (використання, час скидання)
+//	POST /api/limits/refresh       — оновити ліміти коротким запуском claude (haiku)
 //	GET  /api/settings             — налаштування ролей (продовжувати сесію чи починати заново)
 //	PUT  /api/settings             — зберегти налаштування ролей {"roles": [{"role": "...", "resume_session": true}]}
 //
@@ -70,10 +73,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/activity", s.getActivity)
 	mux.HandleFunc("POST /api/tasks/{id}/resume", s.resumeTask)
 	mux.HandleFunc("POST /api/tasks/{id}/stop", s.stopTask)
+	mux.HandleFunc("POST /api/tasks/{id}/retest", s.retestTask)
 	mux.HandleFunc("POST /api/tasks/{id}/plan/approve", s.approvePlan)
 	mux.HandleFunc("POST /api/tasks/{id}/plan/revise", s.revisePlan)
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.deleteTask)
 	mux.HandleFunc("GET /api/info", s.getInfo)
+	mux.HandleFunc("GET /api/limits", s.getLimits)
+	mux.HandleFunc("POST /api/limits/refresh", s.refreshLimits)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.saveSettings)
 	return mux
@@ -124,6 +130,27 @@ func (s *Server) stopTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 202: зупинка асинхронна — агенту потрібно кілька секунд, щоб завершитись.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
+}
+
+func (s *Server) retestTask(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Instructions string `json:"instructions"`
+	}
+	// Тіло необов'язкове: без нього — тестування без додаткових інструкцій.
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New(`очікую JSON {"instructions": "..."}`))
+			return
+		}
+	}
+	task, err := s.pipeline.Retest(r.Context(), r.PathValue("id"), req.Instructions)
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	s.runInBackground(task.ID)
+	task.Running = true
+	writeJSON(w, http.StatusAccepted, task)
 }
 
 func (s *Server) approvePlan(w http.ResponseWriter, r *http.Request) {
@@ -237,8 +264,28 @@ func (s *Server) getInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) getLimits(w http.ResponseWriter, r *http.Request) {
+	limits, err := s.store.ClaudeLimits(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, limits) // null — claude ще жодного разу не повідомив ліміти
+}
+
+func (s *Server) refreshLimits(w http.ResponseWriter, r *http.Request) {
+	// Помилку запуску не вважаємо фатальною: rate_limit_event приходить на
+	// самому початку, тож ліміти могли оновитися навіть якщо claude потім упав
+	// (наприклад, бо ліміт вичерпано).
+	if err := s.pipeline.Runner.CheckLimits(r.Context()); err != nil {
+		slog.Warn("перевірка лімітів Claude завершилась помилкою", "error", err)
+	}
+	s.getLimits(w, r)
+}
+
 type settingsBody struct {
-	Roles []storage.RoleSetting `json:"roles"`
+	Roles  []storage.RoleSetting `json:"roles"`
+	Models []string              `json:"models,omitempty"` // які моделі можна обрати (лише у відповіді)
 }
 
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +294,7 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, settingsBody{Roles: roles})
+	writeJSON(w, http.StatusOK, settingsBody{Roles: roles, Models: storage.Models})
 }
 
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +306,10 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	for _, st := range req.Roles {
 		if !slices.Contains(pipeline.AgentRoles, st.Role) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("невідома роль %q", st.Role))
+			return
+		}
+		if !slices.Contains(storage.Models, st.Model) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("невідома модель %q", st.Model))
 			return
 		}
 	}

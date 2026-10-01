@@ -13,6 +13,7 @@ import { ROLE, VERDICT } from '../meta'
 import { RoleIcon, StatusBadge, VerdictBadge } from '../components/Badges'
 import { PipelineSteps } from '../components/Pipeline'
 import { Clamp, Markdown } from '../components/Markdown'
+import { RetestDialog } from '../components/RetestDialog'
 
 type Tab = 'plan' | 'overview' | 'timeline' | 'repos' | 'live'
 
@@ -109,6 +110,7 @@ function Header({ task: t, onChanged }: { task: Task; onChanged: () => void }) {
   const [deleting, setDeleting] = useState(false)
   const [busy, setBusy] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [retesting, setRetesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   async function copyBranch() {
@@ -206,12 +208,25 @@ function Header({ task: t, onChanged }: { task: Task; onChanged: () => void }) {
             {stopping ? <RefreshCw size={16} className="spin" /> : <Square size={16} />}
             {stopping ? 'Зупиняю…' : 'Зупинити'}
           </button>
-        ) : t.status !== 'COMPLETED' && !isWaiting(t.status) && (
-          <button className="btn btn-primary" onClick={resume} disabled={busy || deleting}>
-            {busy ? <RefreshCw size={16} className="spin" /> : <RotateCcw size={16} />}
-            {t.status === 'FAILED' ? 'Перезапустити' : 'Продовжити'}
-          </button>
+        ) : (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            {/* Лише QA — для готової задачі і для впалої, у якої вже є код (план схвалено). */}
+            {isFinal(t.status) && t.plan_approved_at && (
+              <button className={`btn ${t.status === 'COMPLETED' ? 'btn-primary' : 'btn-soft'}`}
+                onClick={() => setRetesting(true)} disabled={busy || deleting}
+                title="Запустити лише QA-агента, за бажання — з власними інструкціями">
+                <FlaskConical size={16} /> Перетестувати
+              </button>
+            )}
+            {t.status !== 'COMPLETED' && !isWaiting(t.status) && (
+              <button className="btn btn-primary" onClick={resume} disabled={busy || deleting}>
+                {busy ? <RefreshCw size={16} className="spin" /> : <RotateCcw size={16} />}
+                {t.status === 'FAILED' ? 'Перезапустити' : 'Продовжити'}
+              </button>
+            )}
+          </div>
         )}
+        {retesting && <RetestDialog task={t} onClose={() => setRetesting(false)} onStarted={onChanged} />}
         <div style={{ display: 'flex', gap: 8 }}>
           {confirmDelete && (
             <button className="btn btn-ghost btn-sm" onClick={() => setConfirmDelete(false)} disabled={deleting}>
@@ -531,7 +546,8 @@ function Run({ log: l }: { log: TaskLog }) {
           {l.feedback && (
             <div className="file-card">
               <div className="file-card-head">
-                <FileText size={14} /> {isOperator ? 'Твої правки до плану' : 'review_feedback.md'}
+                <FileText size={14} />
+                {isOperator ? 'Твої правки до плану' : l.agent_role === 'tester' ? 'Твої інструкції для QA' : 'review_feedback.md'}
               </div>
               <div className="file-card-body"><Clamp text={l.feedback} limit={1200} /></div>
             </div>

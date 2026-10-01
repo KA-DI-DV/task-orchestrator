@@ -63,6 +63,7 @@ echo "$@" > ` + argsFile + `
 case "$2" in
   wait) trap 'exit 130' INT; while true; do sleep 0.1; done ;;
 esac
+echo '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.78,"resetsAt":1790703000}}}}'
 echo '{"type":"result","result":"ok","num_turns":1}'
 `
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
@@ -108,5 +109,18 @@ func TestRunStop(t *testing.T) {
 	}
 	if d := time.Since(started); d > 5*time.Second {
 		t.Errorf("агент зупинявся %s — Ctrl+C не спрацював, чекали WaitDelay", d)
+	}
+}
+
+// Ліміти підписки з rate_limit_event доходять до OnRateLimits як є.
+func TestRunRateLimits(t *testing.T) {
+	bin, _ := fakeClaude(t)
+	var got json.RawMessage
+	r := &Runner{Binary: bin, Timeout: 10 * time.Second, OnRateLimits: func(info json.RawMessage) { got = info }}
+	if _, err := r.Run(context.Background(), Request{Prompt: "go", WorkDir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"utilization":0.78`) || !strings.Contains(string(got), `"five_hour"`) {
+		t.Errorf("OnRateLimits отримав %s", got)
 	}
 }

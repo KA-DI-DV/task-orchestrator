@@ -41,6 +41,7 @@ export interface Task {
   plan_revision: number // версія плану: 1, 2, ...
   plan_feedback: string // правки, які Архітектор зараз враховує
   plan_approved_at: string | null
+  test_instructions: string // інструкції для QA при повторному тестуванні
   repos?: TaskRepo[]
 }
 
@@ -63,9 +64,31 @@ export interface TaskLog {
   session_mode: '' | 'new' | 'resume' | 'continue' // як агент працював із сесією ('' — старі записи)
 }
 
+// Ліміти підписки Claude — rate_limit_info з події claude (див. internal/storage/limits.go).
+export interface LimitWindow {
+  utilization: number // 0..1 — яку частку ліміту вікна використано
+  resetsAt: number // коли вікно скинеться (unix, секунди)
+}
+
+export interface ClaudeLimits {
+  info: {
+    status: string // allowed / allowed_warning / rejected
+    resetsAt?: number
+    rateLimitType?: string // яке вікно зараз обмежує: five_hour / seven_day / ...
+    unifiedWindows?: Record<string, LimitWindow>
+  }
+  observed_at: string
+}
+
 export interface RoleSetting {
   role: string
   resume_session: boolean // коли задача повертається до ролі — продовжувати її сесію
+  model: string // з якою моделлю запускати агента ролі (повний id, напр. claude-opus-5-5)
+}
+
+export interface Settings {
+  roles: RoleSetting[]
+  models: string[] // які моделі можна обрати
 }
 
 export interface Info {
@@ -93,10 +116,11 @@ export const api = {
   activity: (id: string) =>
     request<{ lines: string[] | null }>(`/api/tasks/${id}/activity`).then((a) => a.lines ?? []),
   info: () => request<Info>('/api/info'),
-  settings: () => request<{ roles: RoleSetting[] }>('/api/settings').then((s) => s.roles),
+  limits: () => request<ClaudeLimits | null>('/api/limits'),
+  refreshLimits: () => request<ClaudeLimits | null>('/api/limits/refresh', { method: 'POST' }),
+  settings: () => request<Settings>('/api/settings'),
   saveSettings: (roles: RoleSetting[]) =>
-    request<{ roles: RoleSetting[] }>('/api/settings', { method: 'PUT', body: JSON.stringify({ roles }) })
-      .then((s) => s.roles),
+    request<Settings>('/api/settings', { method: 'PUT', body: JSON.stringify({ roles }) }),
   create: (jiraUrl: string, repo: string) =>
     request<Task>('/api/tasks', {
       method: 'POST',
@@ -106,6 +130,8 @@ export const api = {
   approvePlan: (id: string) => request<Task>(`/api/tasks/${id}/plan/approve`, { method: 'POST' }),
   revisePlan: (id: string, comment: string) =>
     request<Task>(`/api/tasks/${id}/plan/revise`, { method: 'POST', body: JSON.stringify({ comment }) }),
+  retest: (id: string, instructions: string) =>
+    request<Task>(`/api/tasks/${id}/retest`, { method: 'POST', body: JSON.stringify({ instructions }) }),
   stop: (id: string) => request<unknown>(`/api/tasks/${id}/stop`, { method: 'POST' }),
   remove: (id: string) => request<null>(`/api/tasks/${id}`, { method: 'DELETE' }),
 }

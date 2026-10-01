@@ -74,6 +74,9 @@ type Task struct {
 	// NULL — план ще не схвалено: після (пере)запуску задача йде на планування.
 	PlanApprovedAt *time.Time `db:"plan_approved_at" json:"plan_approved_at"`
 
+	// Додаткові інструкції людини для QA при повторному тестуванні ("" — немає).
+	TestInstructions string `db:"test_instructions" json:"test_instructions"`
+
 	// Running — задачу зараз виконують агенти в цьому процесі. Не з БД:
 	// заповнює API з пам'яті конвеєра.
 	Running bool `db:"-" json:"running"`
@@ -143,7 +146,7 @@ const taskColumns = `
 	title, description, base_commit,
 	COALESCE(last_error, '') AS last_error,
 	test_report, created_at, updated_at, completed_at, agent_role, agent_session,
-	plan, plan_revision, plan_feedback, plan_approved_at,
+	plan, plan_revision, plan_feedback, plan_approved_at, test_instructions,
 	(SELECT COALESCE(SUM(l.cost_usd), 0) FROM task_logs l WHERE l.task_id = tasks.id) AS total_cost_usd,
 	(SELECT COUNT(*) FROM task_repos r WHERE r.task_id = tasks.id AND r.commits > 0) AS changed_repos`
 
@@ -231,12 +234,13 @@ func (s *Store) SaveTask(ctx context.Context, t *Task) error {
 				plan_revision = $15,
 				plan_feedback = $16,
 				plan_approved_at = $17,
+				test_instructions = $18,
 				updated_at = now()
 			WHERE id = $1`,
 			t.ID, t.Status, t.WorktreePath, t.ReviewAttempts, t.LastFeedback,
 			t.Title, t.Description, t.BaseCommit, t.LastError,
 			t.TestReport, t.CompletedAt, t.AgentRole, t.AgentSession,
-			t.Plan, t.PlanRevision, t.PlanFeedback, t.PlanApprovedAt,
+			t.Plan, t.PlanRevision, t.PlanFeedback, t.PlanApprovedAt, t.TestInstructions,
 		)
 		if err != nil {
 			return err

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -51,6 +52,12 @@ func newApp(ctx context.Context, configPath string) (*App, error) {
 		Timeout: cfg.Orchestrator.AgentTimeout,
 		// Журнал дій агентів: /tmp/workspaces/.logs/<KEY>.log (дивитися: task watch KEY=...).
 		LogDir: filepath.Join(cfg.Orchestrator.WorktreesDir, ".logs"),
+		// Ліміти підписки Claude з кожного запуску — в БД, адмінка показує їх у бічній панелі.
+		OnRateLimits: func(info json.RawMessage) {
+			if err := store.SaveClaudeLimits(context.Background(), info); err != nil {
+				slog.Warn("не вдалося зберегти ліміти Claude", "error", err)
+			}
+		},
 	}
 	ws := &workspace.Manager{
 		ReposBaseDir: cfg.Orchestrator.ReposBaseDir,

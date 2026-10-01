@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { NavLink } from 'react-router'
 import { LayoutList, Leaf, Moon, Settings, Sun } from 'lucide-react'
+import { LimitsCard } from './Limits'
 
 type Theme = 'light' | 'dark'
 
@@ -43,6 +44,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </nav>
 
         <div className="sidebar-foot">
+          <LimitsCard />
           <button
             className="btn btn-soft btn-sm"
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}

@@ -228,6 +228,42 @@ func (p *Pipeline) Resume(ctx context.Context, key string) (*storage.Task, error
 	return task, nil
 }
 
+// Retest готує повторне тестування завершеної (або впалої) задачі: запускається
+// лише QA-агент, з додатковими інструкціями людини (можна порожні).
+// Якщо тести пройдуть — задача знову COMPLETED, якщо ні — FAILED зі звітом QA
+// (тоді «Перезапустити» віддасть звіт розробнику).
+// Саме тестування запускає Run (його викликає API після цього методу).
+func (p *Pipeline) Retest(ctx context.Context, key, instructions string) (*storage.Task, error) {
+	if _, busy := p.running.LoadOrStore(key, &runState{}); busy {
+		return nil, fmt.Errorf("%w: задача %s зараз виконується", ErrRunning, key)
+	}
+	defer p.running.Delete(key)
+
+	task, err := p.Store.GetTask(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if !task.Status.IsFinal() {
+		return nil, fmt.Errorf("%w: перетестувати можна лише готову або впалу задачу (статус %s)", ErrWrongState, task.Status)
+	}
+	// Задача впала ще до розробки (на плануванні) — тестувати нічого.
+	// Старим задачам міграція 006 проставила plan_approved_at, тож їх це не зачіпає.
+	if task.PlanApprovedAt == nil {
+		return nil, fmt.Errorf("%w: задача %s ще не дійшла до розробки — коду для тестування немає", ErrWrongState, key)
+	}
+
+	task.Status = storage.StatusInTest
+	task.TestInstructions = strings.TrimSpace(instructions)
+	task.LastError = ""
+	task.CompletedAt = nil
+	task.AgentRole, task.AgentSession = "", ""
+	if err := p.Store.SaveTask(ctx, task); err != nil {
+		return nil, err
+	}
+	slog.Info("перезапускаю тестування", "key", key, "instructions", task.TestInstructions != "")
+	return task, nil
+}
+
 // ErrMerged — задачу не можна видалити: її коміти вже в main.
 var ErrMerged = errors.New("задача вже в main")
 
@@ -424,6 +460,19 @@ func (p *Pipeline) Run(ctx context.Context, key string) error {
 // наприклад, задачу перезапустили після падіння). Створюємо ізольований
 // git worktree для кожного репозиторію задачі.
 func (p *Pipeline) prepare(ctx context.Context, task *storage.Task) error {
+	if err := p.createWorktrees(ctx, task); err != nil {
+		return err
+	}
+	task.Status = storage.StatusInPlanning
+	if task.PlanApprovedAt != nil {
+		task.Status = storage.StatusInDev
+	}
+	return nil
+}
+
+// createWorktrees створює (або відкриває наявні) worktree для всіх репозиторіїв
+// задачі на гілці задачі.
+func (p *Pipeline) createWorktrees(ctx context.Context, task *storage.Task) error {
 	// range по індексу: r — вказівник на елемент слайсу, тож зміни
 	// потраплять у сам task.Repos (а не в його копію).
 	for i := range task.Repos {
@@ -446,10 +495,6 @@ func (p *Pipeline) prepare(ctx context.Context, task *storage.Task) error {
 	}
 	task.WorktreePath = main.WorktreePath
 	task.BaseCommit = main.BaseCommit
-	task.Status = storage.StatusInPlanning
-	if task.PlanApprovedAt != nil {
-		task.Status = storage.StatusInDev
-	}
 	return nil
 }
 
@@ -572,16 +617,23 @@ func (p *Pipeline) review(ctx context.Context, task *storage.Task) error {
 // test: IN_TEST → COMPLETED або FAILED.
 func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	iteration := task.ReviewAttempts + 1
+	// Після завершення задачі worktree видаляються. Якщо тестування
+	// перезапустили («Перетестувати») — відкриваємо їх знову з гілки задачі.
+	if err := p.createWorktrees(ctx, task); err != nil {
+		return err
+	}
 	changed, err := p.changedRepos(ctx, task)
 	if err != nil {
 		return err
 	}
 	run, err := p.runAgent(ctx, task, "tester", testerPrompt(task, changed))
 	res := run.Result
+	instructions := task.TestInstructions // показуємо в хронології біля запуску
 	if err != nil {
-		p.addLog(ctx, task, stepTesting, "tester", iteration, run, err, "", "")
+		p.addLog(ctx, task, stepTesting, "tester", iteration, run, err, "", instructions)
 		return err
 	}
+	task.TestInstructions = "" // відпрацювали — наступне тестування вже без них
 
 	// Тестувальник міг дописати тести — зберігаємо їх у гілці.
 	if err := p.commitAll(ctx, task, task.ID+": тести від QA-агента"); err != nil {
@@ -593,13 +645,13 @@ func (p *Pipeline) test(ctx context.Context, task *storage.Task) error {
 	task.TestReport = res.Text
 
 	if !isTestPassed(res.Text) {
-		p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testFailed, "")
+		p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testFailed, instructions)
 		// Звіт тестувальника стане фідбеком для Developer'а при resume.
 		task.LastFeedback = "Звіт QA:\n" + res.Text
 		return errors.New("тестування не пройдено, подробиці — у звіті QA")
 	}
 
-	p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testPassed, "")
+	p.addLog(ctx, task, stepTesting, "tester", iteration, run, nil, testPassed, instructions)
 	p.cleanup(ctx, task)
 	now := time.Now()
 	task.CompletedAt = &now
@@ -638,7 +690,8 @@ func (p *Pipeline) runAgent(ctx context.Context, task *storage.Task, role, promp
 		}
 	}
 
-	if p.resumeEnabled(ctx, role) {
+	setting := p.roleSetting(ctx, role)
+	if setting.ResumeSession {
 		session, err := p.Store.RoleSession(ctx, task.ID, role)
 		if err != nil {
 			return &agentRun{Prompt: prompt}, fmt.Errorf("читання сесії ролі %s: %w", role, err)
@@ -693,15 +746,20 @@ func (p *Pipeline) rememberSession(ctx context.Context, task *storage.Task, role
 	return nil
 }
 
-// resumeEnabled каже, чи для ролі ввімкнено «продовжувати сесію».
-// Якщо налаштування не вдалося прочитати — діє значення за замовчуванням (так).
-func (p *Pipeline) resumeEnabled(ctx context.Context, role string) bool {
+// roleSetting — налаштування ролі з адмін-панелі (продовжувати сесію, модель).
+// Якщо їх не вдалося прочитати — значення за замовчуванням: продовжувати сесію,
+// модель з config.yaml або storage.DefaultModel.
+func (p *Pipeline) roleSetting(ctx context.Context, role string) storage.RoleSetting {
 	settings, err := p.Store.RoleSettings(ctx, []string{role})
 	if err != nil {
-		slog.Warn("не вдалося прочитати налаштування ролі, продовжую сесію", "role", role, "error", err)
-		return true
+		slog.Warn("не вдалося прочитати налаштування ролі, беру значення за замовчуванням", "role", role, "error", err)
+		model := p.Roles[role].Model
+		if model == "" {
+			model = storage.DefaultModel
+		}
+		return storage.RoleSetting{Role: role, ResumeSession: true, Model: model}
 	}
-	return settings[0].ResumeSession
+	return settings[0]
 }
 
 // launchAgent запускає claude з налаштуваннями ролі.
@@ -724,7 +782,7 @@ func (p *Pipeline) launchAgent(ctx context.Context, task *storage.Task, role, pr
 		WorkDir:           task.WorktreePath,
 		Prompt:            prompt,
 		SystemInstruction: roleCfg.SystemInstruction,
-		Model:             roleCfg.Model,
+		Model:             p.roleSetting(ctx, role).Model, // обирається в адмін-панелі
 		ExtraFlags:        flags,
 		SessionID:         session,
 		Resume:            resume,

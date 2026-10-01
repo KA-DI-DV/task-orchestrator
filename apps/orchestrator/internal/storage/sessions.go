@@ -35,29 +35,35 @@ func (s *Store) SetRoleSession(ctx context.Context, taskID, role, session string
 	return err
 }
 
+// DefaultModel — модель ролі, поки її не змінили в адмін-панелі.
+const DefaultModel = "claude-opus-5-5"
+
+// Models — моделі, які можна обрати для ролі (повні id: короткі псевдоніми
+// на кшталт "sonnet" у CLI можуть вести на попереднє покоління).
+var Models = []string{"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"}
+
 // RoleSetting — налаштування однієї ролі з адмін-панелі.
 type RoleSetting struct {
 	Role string `json:"role"`
 	// ResumeSession: коли задача повертається до ролі, продовжувати її сесію
 	// (claude --resume), а не починати нову розмову.
 	ResumeSession bool `json:"resume_session"`
+	// Model — з якою моделлю claude запускати агента цієї ролі.
+	Model string `json:"model"`
 }
 
 // RoleSettings повертає налаштування для ролей roles (у тому ж порядку).
 // Ролі, яких немає в базі, отримують значення за замовчуванням: продовжувати сесію.
 func (s *Store) RoleSettings(ctx context.Context, roles []string) ([]RoleSetting, error) {
-	rows, err := s.pool.Query(ctx, `SELECT role, resume_session FROM role_settings`)
+	rows, err := s.pool.Query(ctx, `SELECT role, resume_session, model FROM role_settings`)
 	if err != nil {
 		return nil, err
 	}
-	saved := map[string]bool{}
-	var (
-		role   string
-		resume bool
-	)
-	// ForEachRow викликає функцію для кожного рядка, підставивши колонки в role і resume.
-	if _, err := pgx.ForEachRow(rows, []any{&role, &resume}, func() error {
-		saved[role] = resume
+	saved := map[string]RoleSetting{}
+	var st RoleSetting
+	// ForEachRow викликає функцію для кожного рядка, підставивши колонки в поля st.
+	if _, err := pgx.ForEachRow(rows, []any{&st.Role, &st.ResumeSession, &st.Model}, func() error {
+		saved[st.Role] = st
 		return nil
 	}); err != nil {
 		return nil, err
@@ -65,8 +71,14 @@ func (s *Store) RoleSettings(ctx context.Context, roles []string) ([]RoleSetting
 
 	settings := make([]RoleSetting, 0, len(roles))
 	for _, r := range roles {
-		resume, ok := saved[r]
-		settings = append(settings, RoleSetting{Role: r, ResumeSession: resume || !ok})
+		st, ok := saved[r]
+		if !ok {
+			st = RoleSetting{Role: r, ResumeSession: true} // за замовчуванням — продовжувати сесію
+		}
+		if st.Model == "" {
+			st.Model = DefaultModel
+		}
+		settings = append(settings, st)
 	}
 	return settings, nil
 }
@@ -76,9 +88,12 @@ func (s *Store) SaveRoleSettings(ctx context.Context, settings []RoleSetting) er
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		for _, st := range settings {
 			_, err := tx.Exec(ctx, `
-				INSERT INTO role_settings (role, resume_session) VALUES ($1, $2)
-				ON CONFLICT (role) DO UPDATE SET resume_session = EXCLUDED.resume_session, updated_at = now()`,
-				st.Role, st.ResumeSession)
+				INSERT INTO role_settings (role, resume_session, model) VALUES ($1, $2, $3)
+				ON CONFLICT (role) DO UPDATE SET
+					resume_session = EXCLUDED.resume_session,
+					model          = EXCLUDED.model,
+					updated_at     = now()`,
+				st.Role, st.ResumeSession, st.Model)
 			if err != nil {
 				return err
 			}

@@ -258,7 +258,7 @@ func testerPrompt(t *storage.Task, changed []storage.TaskRepo) string {
 	return fmt.Sprintf(`Ти — QA-інженер. Перевір, що задача нижче реалізована і працює.
 
 %s%s%s
-%s
+%s%s
 ## Що зробити
 1. У кожному зміненому репозиторії знайди і запусти локальні тести (unit/integration).%s
 2. Якщо в проєкті є веб-інтерфейс і тобі доступний Browser MCP (Playwright) —
@@ -268,7 +268,7 @@ func testerPrompt(t *storage.Task, changed []storage.TaskRepo) string {
 ## Формат відповіді (обов'язково)
 Коротко опиши, що перевірено і з яким результатом, додай розділ «%s», а останнім рядком напиши рівно:
 %s %s — якщо все працює, або %s %s — якщо є проблеми.
-`, taskHeader(t), workspaceSection(t), planSection(t), diffSection(changed), testerPlanRules(t),
+`, taskHeader(t), workspaceSection(t), planSection(t), diffSection(changed), testInstructionsSection(t), testerPlanRules(t),
 		briefSection(
 			"які автотести запускав і з яким результатом (скільки пройшло / впало);",
 			"які сценарії перевіряв вручну або в браузері;",
@@ -276,6 +276,17 @@ func testerPrompt(t *storage.Task, changed []storage.TaskRepo) string {
 			"що не працює, якщо є проблеми.",
 		), briefHeading,
 		testPrefix, testPassed, testPrefix, testFailed)
+}
+
+// testInstructionsSection — інструкції людини, коли тестування перезапустили вручну.
+func testInstructionsSection(t *storage.Task) string {
+	if t.TestInstructions == "" {
+		return ""
+	}
+	return "\n## Додаткові інструкції від людини (пріоритетні)\n" +
+		"Тестування перезапустили вручну. Обов'язково виконай ці інструкції; якщо вони суперечать\n" +
+		"загальним правилам нижче — слухайся їх. У звіті окремо напиши, що зроблено за кожною.\n\n" +
+		t.TestInstructions + "\n"
 }
 
 func testerPlanRules(t *storage.Task) string {

@@ -181,3 +181,17 @@ func TestExtractPlan(t *testing.T) {
 		}
 	}
 }
+
+func TestTesterPromptInstructions(t *testing.T) {
+	task := &storage.Task{ID: "PROJ-1", BranchName: "feature/PROJ-1"}
+	if strings.Contains(testerPrompt(task, nil), "Додаткові інструкції") {
+		t.Error("без інструкцій розділу не має бути")
+	}
+	task.TestInstructions = "Перевір лише ручний перезапуск виплат"
+	prompt := testerPrompt(task, nil)
+	for _, want := range []string{"Додаткові інструкції від людини (пріоритетні)", "Перевір лише ручний перезапуск виплат", "TEST_RESULT:"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("testerPrompt не містить %q", want)
+		}
+	}
+}
